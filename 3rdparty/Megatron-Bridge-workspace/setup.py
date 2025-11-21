@@ -33,7 +33,7 @@ CACHED_DEPENDENCIES = [
     "rich",
     "wandb>=0.19.10",
     "six>=1.17.0",
-    "regex>=2024.11.6",
+    "regex>=2025.11.3",
     "pyyaml>=6.0.2",
     "tqdm>=4.67.1",
     "hydra-core>1.3,<=1.3.2",
