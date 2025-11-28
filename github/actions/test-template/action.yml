@@ -70,7 +70,7 @@ runs:
 
     - name: Azure Login
       if: ${{ inputs.has-azure-credentials == 'true' }}
-      uses: azure/login@v2
+      uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
       with:
         client-id: ${{ inputs.azure-client-id }}
         tenant-id: ${{ inputs.azure-tenant-id }}
@@ -153,7 +153,7 @@ runs:
         echo "id=$(uuidgen)" >> "$GITHUB_OUTPUT"
 
     - name: Checkout NeMo
-      uses: actions/checkout@v2
+      uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6
       env:
         DIR: ${{ github.run_id }}
       with:
@@ -211,7 +211,7 @@ runs:
         exit $EXIT_CODE
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
       if: ${{ steps.check.outputs.coverage_report != 'none' }}
       with:
         name: ${{ steps.check.outputs.coverage_report }}
