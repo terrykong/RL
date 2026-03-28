@@ -1,0 +1,119 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:best-practices",
+    ":dependencyDashboard"
+  ],
+  "timezone": "America/Los_Angeles",
+  "cloneSubmodules": true,
+  "customEnvVariables": {
+    "NRL_AUTO_SYNC_DEPS": "1"
+  },
+  "prConcurrentLimit": 1,
+  "prHourlyLimit": 0,
+  "semanticCommits": "disabled",
+  "commitMessagePrefix": "[Renovate]",
+  "branchPrefix": "renovate/",
+  "labels": [
+    "dependencies",
+    "CI:L2"
+  ],
+  "assignees": [],
+  "reviewers": [],
+  "postUpgradeTasks": {
+    "commands": [
+      ".github/scripts/renovate_post_update.sh"
+    ],
+    "fileFilters": [
+      "uv.lock",
+      "3rdparty/**/setup.py"
+    ],
+    "executionMode": "update"
+  },
+  "packageRules": [
+    {
+      "description": "Disable Python dependency updates unless explicitly allowlisted",
+      "matchManagers": [
+        "pep621"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Allowlisted training stack dependencies (from initial requirements)",
+      "matchManagers": [
+        "pep621"
+      ],
+      "matchPackageNames": [
+        "vllm",
+        "transformer-engine",
+        "flash-attn"
+      ],
+      "enabled": true
+    },
+    {
+      "description": "Disable Python version updates (pyenv, github-actions python)",
+      "matchManagers": [
+        "pyenv"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Disable Python runtime version updates in GitHub Actions",
+      "matchPackageNames": [
+        "python"
+      ],
+      "matchManagers": [
+        "github-actions"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Disable alternate Python managers that duplicate pep621 coverage",
+      "matchManagers": [
+        "pip_setup",
+        "poetry",
+        "pixi",
+        "uv"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Disable Docker base image updates by default (enable manually when needed)",
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Group every allowed update into a single PR",
+      "matchPackagePatterns": [
+        "*"
+      ],
+      "groupName": "dependency updates",
+      "additionalBranchPrefix": "deps-",
+      "separateMajorMinor": false,
+      "separateMultipleMajor": false
+    }
+  ],
+  "git-submodules": {
+    "enabled": true
+  },
+  "pep621": {
+    "enabled": true,
+    "fileMatch": ["(^|/)pyproject\\.toml$"],
+    "updateLockFiles": false
+  },
+  "lockFileMaintenance": {
+    "enabled": false
+  },
+  "vulnerabilityAlerts": {
+    "enabled": false
+  },
+  "osvVulnerabilityAlerts": false,
+  "rangeStrategy": "bump",
+  "platformAutomerge": false,
+  "rebaseWhen": "behind-base-branch",
+  "recreateWhen": "always",
+  "forkProcessing": "enabled",
+  "includeForks": true
+}

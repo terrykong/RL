@@ -1,0 +1,160 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Renovate
+
+on:
+  schedule:
+    # Run daily at 5 PM UTC (9 AM PST / 10 AM PDT) to align with Renovate schedule
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+    inputs:
+      log_level:
+        description: 'Renovate log level'
+        required: false
+        default: 'info'
+        type: choice
+        options:
+          - debug
+          - info
+          - warn
+          - error
+      update_docker:
+        description: 'Include Docker base image updates (normally disabled)'
+        required: false
+        default: false
+        type: boolean
+      force_run:
+        description: 'Force run ignoring schedule restrictions (always create PRs)'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  renovate:
+    name: Renovate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          submodules: 'recursive'
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: '3.14.3'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.11.2"
+          enable-cache: true
+          prune-cache: false
+
+      - name: Make scripts executable
+        run: |
+          chmod +x .github/scripts/sync_submodule_dependencies.py
+          chmod +x .github/scripts/renovate_post_update.sh
+          chmod +x .github/scripts/renovate_cmd.sh
+
+      - name: Configure Renovate options
+        id: config
+        run: |
+          # Enable Docker updates if requested (modify config temporarily)
+          if [ "${{ inputs.update_docker }}" = "true" ]; then
+            echo "Enabling Docker base image updates..."
+            jq '(.packageRules[] | select(.matchManagers == ["dockerfile"])).enabled = true' \
+              .github/renovate.json > .github/renovate.json.tmp && \
+              mv .github/renovate.json.tmp .github/renovate.json
+          fi
+          
+          # Build RENOVATE_FORCE JSON if force_run is enabled
+          if [ "${{ inputs.force_run }}" = "true" ]; then
+            echo "Force run enabled - ignoring schedule restrictions"
+            echo 'force_json={"schedule":[]}' >> $GITHUB_OUTPUT
+          else
+            echo 'force_json=' >> $GITHUB_OUTPUT
+          fi
+
+      - name: Pre-clone repository with full submodule history
+        env:
+          RENOVATE_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
+        run: |
+          # Pre-clone the repo to where Renovate expects it, with unshallowed submodules
+          # Renovate will reuse this clone instead of cloning fresh
+          CLONE_DIR="/tmp/renovate/repos/github/${{ github.repository_owner }}/${{ github.event.repository.name }}"
+          mkdir -p "$(dirname "$CLONE_DIR")"
+          
+          echo "Cloning to $CLONE_DIR with full submodule history..."
+          git clone --recurse-submodules \
+            "https://x-access-token:${RENOVATE_TOKEN}@github.com/${{ github.repository }}.git" \
+            "$CLONE_DIR"
+          
+          cd "$CLONE_DIR"
+          
+          # Unshallow all submodules (they were cloned shallow due to .gitmodules setting)
+          echo "Unshallowing submodules..."
+          git submodule foreach --recursive 'git fetch --unshallow origin 2>/dev/null || echo "Already unshallow or no remote"'
+          
+          echo ""
+          echo "Submodule status:"
+          git submodule status --recursive
+          
+          # Copy the renovate command wrapper to /tmp so it's accessible in the container
+          # This wrapper sets git safe.directory before running renovate
+          # Use GITHUB_WORKSPACE since we've cd'd into the pre-cloned directory
+          cp "${GITHUB_WORKSPACE}/.github/scripts/renovate_cmd.sh" /tmp/renovate_cmd.sh
+          chmod +x /tmp/renovate_cmd.sh
+          
+          # Fix permissions for Renovate container (runs as uid 1000)
+          # Make everything world-writable so the container user can access it
+          chmod -R 777 /tmp/renovate
+
+      # Option 1: Use GitHub App token (recommended for better rate limits)
+      # Requires RENOVATE_APP_ID and RENOVATE_APP_PRIVATE_KEY secrets
+      # If these secrets aren't set, this step will be skipped and PAT will be used
+      - name: Get GitHub App token
+        id: get-app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3
+        with:
+          app-id: ${{ secrets.RENOVATE_APP_ID }}
+          private-key: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
+
+      - name: Run Renovate
+        uses: renovatebot/github-action@68a3ea99af6ad249940b5a9fdf44fc6d7f14378b # v46.1.6
+        with:
+          configurationFile: .github/renovate.json
+          # Use GitHub App token if available, otherwise fall back to PAT
+          token: ${{ steps.get-app-token.outputs.token || secrets.RENOVATE_TOKEN }}
+          # Use custom command that sets git safe.directory before running renovate
+          # This avoids "dubious ownership" errors with the pre-cloned repo
+          docker-cmd-file: /tmp/renovate_cmd.sh
+          # Pass NRL_AUTO_SYNC_DEPS to container (extends default env-regex)
+          env-regex: '^(?:RENOVATE_\w+|LOG_LEVEL|GITHUB_COM_TOKEN|NODE_OPTIONS|(?:HTTPS?|NO)_PROXY|(?:https?|no)_proxy|NRL_AUTO_SYNC_DEPS)$'
+        env:
+          LOG_LEVEL: ${{ inputs.log_level || 'info' }}
+          # Explicitly set which repository to process
+          RENOVATE_REPOSITORIES: ${{ github.repository }}
+          # Global-only configuration options
+          RENOVATE_ONBOARDING: 'false'
+          RENOVATE_REQUIRE_CONFIG: 'optional'
+          RENOVATE_ALLOWED_POST_UPGRADE_COMMANDS: '["^\\.github/scripts/renovate_post_update\\.sh$"]'
+          # Enable auto-sync of CACHED_DEPENDENCIES in 3rdparty setup.py files
+          # This allows submodule updates to proceed without manual intervention
+          NRL_AUTO_SYNC_DEPS: '1'
+          # Force run ignoring schedule (when triggered manually with force_run=true)
+          RENOVATE_FORCE: ${{ steps.config.outputs.force_json }}
+
