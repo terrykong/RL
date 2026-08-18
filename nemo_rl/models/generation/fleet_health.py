@@ -62,6 +62,13 @@ class ShardState(str, enum.Enum):
 # transient blip cost a shard's worth of throughput.
 _SERVING_STATES = frozenset({ShardState.HEALTHY, ShardState.SUSPECT})
 
+# States whose process cannot take part in a collective, because it is gone or coming
+# back. This is deliberately NOT the complement of _SERVING_STATES: SUSPECT and STALE are
+# not handed traffic but their processes are alive and join a refit normally. Refitting a
+# STALE shard is precisely how it stops being stale, so counting it absent would break
+# the recovery this distinction exists to enable.
+_ABSENT_STATES = frozenset({ShardState.DEAD, ShardState.RESTARTING, ShardState.RETIRED})
+
 
 @dataclass
 class ShardHealth:
@@ -178,6 +185,19 @@ class GenerationFleetHealth:
         """Shard indices currently eligible to be handed traffic."""
         return [idx for idx in sorted(self._shards) if self._shards[idx].is_serving]
 
+    def absent_shards(self) -> list[int]:
+        """Shard indices whose process cannot take part in a collective.
+
+        The set the weight-refit path cares about, and deliberately not the complement of
+        :meth:`serving_shards`: a SUSPECT or STALE shard is withheld from traffic but its
+        process is alive and joins the refit normally.
+        """
+        return [
+            idx
+            for idx in sorted(self._shards)
+            if self._shards[idx].state in _ABSENT_STATES
+        ]
+
     def state_of(self, shard_idx: int) -> ShardState:
         return self._shards[shard_idx].state
 
@@ -249,6 +269,33 @@ class GenerationFleetHealth:
         elif shard.state is ShardState.HEALTHY:
             self._transition(shard, ShardState.SUSPECT)
 
+    def record_actor_death(self, shard_idx: int, error: str = "") -> None:
+        """Record proof that a shard's process is gone. DEAD at once, no counting.
+
+        The counters in :meth:`record_probe` exist to tell a slow shard from a dead one,
+        because a probe timeout cannot distinguish them. Some evidence carries no such
+        ambiguity: Ray reporting its actor dead means the process is gone, full stop, and
+        making that wait for ``unhealthy_threshold`` more rounds of the same answer only
+        delays the conclusion.
+
+        The delay was not academic. Detection took ``probe_interval_s *
+        unhealthy_threshold``, which the refit deadline could expire inside -- so a refit
+        hung on a dead rank aborted while the monitor still had that rank SUSPECT, and
+        the rebuild the abort exists to trigger had an empty absent set to work from.
+        Job 5925668.
+
+        Ignores shards that are already absent, so a repeat report is idempotent, and
+        RETIRED is never disturbed.
+        """
+        shard = self._shards[shard_idx]
+        if shard.state in _ABSENT_STATES:
+            return
+        if error:
+            shard.last_error = error
+        shard.consecutive_probe_successes = 0
+        shard.consecutive_probe_failures = self._policy.unhealthy_threshold
+        self._transition(shard, ShardState.DEAD)
+
     def report_failure(self, shard_idx: int, error: BaseException) -> None:
         """Record a failure observed by a routing adapter rather than by a probe.
 
@@ -310,6 +357,22 @@ class GenerationFleetHealth:
         """The replacement finished loading. It holds stale weights until refit."""
         shard = self._shards[shard_idx]
         if shard.state is ShardState.RETIRED:
+            return
+        self._transition(shard, ShardState.STALE)
+
+    def mark_weights_partial(self, shard_idx: int) -> None:
+        """An aborted refit left this shard holding a mix of old and new weights.
+
+        STALE rather than DEAD: the process is alive and refits normally, it just must not
+        serve until a refit completes. That is exactly what STALE already means, and
+        because DEAD -> HEALTHY is unreachable and STALE ignores successful probes, the
+        only route back into the serving set is report_refit -- which is the property that
+        makes partial weights safe to hold.
+
+        Absent shards are left alone; they are not serving and their problem is not weights.
+        """
+        shard = self._shards[shard_idx]
+        if shard.state in _ABSENT_STATES:
             return
         self._transition(shard, ShardState.STALE)
 

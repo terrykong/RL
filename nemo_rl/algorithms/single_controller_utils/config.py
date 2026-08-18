@@ -184,6 +184,14 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     max_restart_attempts_per_shard: PositiveInt = 5
     # Serving shards below which the run cannot usefully continue.
     min_healthy_shards: PositiveInt = 1
+    # Deadline for one refit collective, after which each participating worker aborts its
+    # own communicator and the controller rebuilds over the survivors and retries once.
+    #
+    # None disarms it: no watchdog thread is started and the refit path is byte-identical
+    # to before. Set it well above a healthy refit -- observed at ~1.9s for a 1.5B model on
+    # GB200 -- because the cost of firing early is aborting a run that was merely slow,
+    # while the cost of firing late is only that a wedge lasts longer before it is broken.
+    refit_timeout_s: Optional[PositiveFloat] = None
 
     @model_validator(mode="after")
     def _check_consistent(self) -> "FleetHealthConfig":
@@ -339,6 +347,33 @@ class AsyncRLConfig(BaseModel, extra="allow"):
             raise ValueError(
                 "async_rl blocks have been renamed to say what they watch or route:\n"
                 + "\n".join(stale)
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_router_deadline_fits_inside_the_rollout(self) -> "AsyncRLConfig":
+        """The router's per-request deadline must not outlast the whole rollout's.
+
+        ``backend_timeout_s`` bounds ONE HTTP call; ``rollout_timeout_s`` bounds the whole
+        prompt-group stream, which is many of them. Set the inner one larger and it can
+        never fire: the rollout deadline always expires first, so the timeout the router
+        exists to add is dead config -- the silent no-op shape this series exists to
+        remove. It is also the wrong failure to surface, because the rollout layer reports
+        the group while the router could have named the backend.
+        """
+        rollout_timeout_s = self.rollout_failure.nemo_gym.rollout_timeout_s
+        if (
+            self.generation_router.enabled
+            and rollout_timeout_s is not None
+            and self.generation_router.backend_timeout_s > rollout_timeout_s
+        ):
+            raise ValueError(
+                "async_rl.generation_router.backend_timeout_s "
+                f"({self.generation_router.backend_timeout_s}) exceeds "
+                "async_rl.rollout_failure.nemo_gym.rollout_timeout_s "
+                f"({rollout_timeout_s}), which bounds the whole prompt-group stream that "
+                "request belongs to. The rollout deadline would always fire first and the "
+                "router's would never fire at all."
             )
         return self
 

@@ -58,6 +58,9 @@ from nemo_rl.models.generation.openai_server_utils import (
 LOGGER = logging.getLogger(__name__)
 
 
+from nemo_rl.distributed.refit_watchdog import RefitAborted
+
+
 class VllmAsyncGenerationWorkerImpl(
     VllmAsyncCheckpointEngineRpcMixin, BaseVllmGenerationWorker
 ):
@@ -1446,7 +1449,9 @@ class VllmAsyncGenerationWorkerImpl(
             traceback.print_exc()
             return False
 
-    async def update_weights_from_collective_async(self) -> bool:
+    async def update_weights_from_collective_async(
+        self, refit_timeout_s: float | None = None
+    ) -> bool:
         """Async version of update_weights_from_collective."""
         try:
             assert self.llm is not None, (
@@ -1459,7 +1464,7 @@ class VllmAsyncGenerationWorkerImpl(
                 )
 
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
+                "update_weights_from_collective", args=(refit_timeout_s,)
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1475,6 +1480,12 @@ class VllmAsyncGenerationWorkerImpl(
                 )
                 return False
             return True
+        except RefitAborted:
+            # Must propagate, not be folded into `return False`. It is the
+            # controller's signal to rebuild over the survivors and retry;
+            # reported as a generic failure it would just fail the run, which
+            # is the wedge this exists to replace.
+            raise
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
             import traceback
@@ -1510,7 +1521,9 @@ class VllmAsyncGenerationWorkerImpl(
             "prepare_nccl_reshard_refit_info", args=(refit_info,)
         )
 
-    async def nccl_reshard_refit_async(self) -> bool:
+    async def nccl_reshard_refit_async(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> bool:
         """Async version of nccl_reshard_refit."""
         try:
             assert self.llm is not None, (
@@ -1518,7 +1531,7 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
             result_or_coro = await self.llm.collective_rpc(
-                "nccl_reshard_refit", args=tuple()
+                "nccl_reshard_refit", args=(refit_timeout_s,)
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1534,6 +1547,11 @@ class VllmAsyncGenerationWorkerImpl(
                 )
                 return False
             return True
+        except RefitAborted:
+            # Propagate, do not fold into `return False`. It is the controller's signal
+            # to rebuild over the survivors and retry; reported as a generic failure it
+            # would just end the run, which is the wedge this exists to replace.
+            raise
         except Exception as e:
             print(f"Exception during nccl_reshard_refit: {e}", flush=True)
             import traceback
