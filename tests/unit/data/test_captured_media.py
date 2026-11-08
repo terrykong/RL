@@ -773,7 +773,7 @@ def test_worker_restart_validates_retained_media(
 def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp):
     from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
 
-    from nemo_rl.models.generation.generation_cut_capture import (
+    from nemo_rl.models.generation.prefix_recovery.state import (
         _TokenCaptureSnapshotGate,
     )
 

@@ -60,8 +60,10 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
     _context_capped_max_new_tokens,
     _resolve_enable_prefix_caching,
 )
+from nemo_rl.models.generation.vllm.generation_cut_route import (
+    GENERATION_CUT_ROUTE as _GENERATION_CUT_ROUTE,
+)
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
-    _GENERATION_CUT_ROUTE,
     VllmAsyncGenerationWorkerImpl,
     _AsyncLLMHTTPClient,
 )
