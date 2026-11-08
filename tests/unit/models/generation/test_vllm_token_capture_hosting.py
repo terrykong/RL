@@ -58,23 +58,31 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     StagedPrefix,
     TQTokenSink,
 )
-from nemo_rl.models.generation.generation_cut_capture import (  # noqa: E402
-    _remaining_generation_limits_after_prefix,
-    _RequestCaptureState,
-    _TokenCaptureSnapshotGate,
+from nemo_rl.models.generation.prefix_recovery.progress import (  # noqa: E402
+    ProgressRead as _EngineProgressRead,
+)
+from nemo_rl.models.generation.prefix_recovery.recovery import (  # noqa: E402
     initial_generation_cut_counts,
 )
-from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
-from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
-    _GENERATION_CUT_ROUTE,
-    _CAPTURED_MODEL_CALL,
-    _EngineProgressRead,
-    _AsyncLLMHTTPClient,
-    VllmAsyncGenerationWorkerImpl,
+from nemo_rl.models.generation.prefix_recovery.restore import (  # noqa: E402
     _classify_restored_prefix_terminal,
     _count_restored_prefix_as_completion,
     _generation_cut_blockers,
+    _remaining_generation_limits_after_prefix,
     _RestoredPrefixTerminal,
+)
+from nemo_rl.models.generation.prefix_recovery.state import (  # noqa: E402
+    _RequestCaptureState,
+    _TokenCaptureSnapshotGate,
+)
+from nemo_rl.models.generation.vllm.generation_cut_route import (  # noqa: E402
+    GENERATION_CUT_ROUTE as _GENERATION_CUT_ROUTE,
+)
+from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
+from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
+    _CAPTURED_MODEL_CALL,
+    _AsyncLLMHTTPClient,
+    VllmAsyncGenerationWorkerImpl,
 )
 
 pytestmark = pytest.mark.nemo_gym
@@ -470,7 +478,7 @@ def test_restored_call_replays_its_prefix_with_the_original_settings(monkeypatch
         return "answer: 4"
 
     monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async._detokenize_restored_prefix",
+        "nemo_rl.models.generation.prefix_recovery.restore._detokenize_restored_prefix",
         replay,
     )
     tokenizer = object()
@@ -1381,7 +1389,7 @@ def test_generation_cut_of_a_call_with_no_tokens_logs_at_debug(caplog):
     inventory, (empty,) = _active_call_inventory(worker, ("empty", []))
 
     with caplog.at_level(
-        logging.DEBUG, logger="nemo_rl.models.generation.generation_cut_capture"
+        logging.DEBUG, logger="nemo_rl.models.generation.prefix_recovery.recovery"
     ):
         receipt = worker._checkpoint_generation_cut(inventory)
 
@@ -1524,7 +1532,7 @@ def test_sampling_settings_a_resumed_tail_cannot_honor_keep_the_call_uncut(
     setting, monkeypatch
 ):
     monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async._LOGGED_UNCUTTABLE_REASONS",
+        "nemo_rl.models.generation.prefix_recovery.recovery._LOGGED_UNCUTTABLE_REASONS",
         set(),
     )
     sink = _MemorySink()
@@ -1619,7 +1627,7 @@ def test_bad_word_check_uses_vllms_own_expansion():
 
 def test_uncuttable_sampling_settings_warn_once_per_reason(monkeypatch, caplog):
     monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async._LOGGED_UNCUTTABLE_REASONS",
+        "nemo_rl.models.generation.prefix_recovery.recovery._LOGGED_UNCUTTABLE_REASONS",
         set(),
     )
     states = [SimpleNamespace(uncuttable_reason=None, lock=threading.Lock())]
@@ -1882,7 +1890,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(
         return "partial"
 
     monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async._detokenize_restored_prefix",
+        "nemo_rl.models.generation.prefix_recovery.restore._detokenize_restored_prefix",
         replay,
     )
     # vLLM's processed tail: EOS and any matched stop string already stripped.
