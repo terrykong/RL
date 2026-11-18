@@ -40,7 +40,7 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field, replace
 from graphlib import CycleError, TopologicalSorter
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, cast
 
 import torch
 
@@ -50,9 +50,6 @@ from nemo_rl.data.captured_media import (
     verify_media_geometry,
 )
 from nemo_rl.data.multimodal_utils import PackedTensor
-from nemo_rl.data.packing.shared_prefix_metadata import (
-    SHARED_PREFIX_PROMPT_LENGTHS,
-)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
@@ -374,7 +371,16 @@ def _media_fields_for_group(rows: list[FinalizedRollout]) -> dict[str, PackedTen
 
 
 class RolloutReassembler:
-    """Receipts -> verified rows -> N-row publish, off the generation hot path."""
+    """Receipts -> verified rows -> N-row publish, off the generation hot path.
+
+    Subclasses add per-row columns by setting :attr:`extra_row_columns` and
+    overriding :meth:`_row_extras`. ``token_capture.reassembler`` picks the
+    class (see :mod:`nemo_rl.experience.reassembler_registry`), and setup adds
+    the columns to the partition schema.
+    """
+
+    # Names of the extra per-row tensor columns :meth:`_row_extras` returns.
+    extra_row_columns: ClassVar[tuple[str, ...]] = ()
 
     def __init__(
         self,
@@ -392,7 +398,6 @@ class RolloutReassembler:
         media_columns: Optional[MediaColumnSpec] = None,
         tokenizer: Any = None,
         thinking_tags: Sequence[str] | None = None,
-        include_shared_prefix_metadata: bool = False,
         top_logprobs: int = 0,
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
@@ -412,7 +417,6 @@ class RolloutReassembler:
                 "size the serving workers pinned the staging column to)"
             )
         self._media_columns = media_columns
-        self._include_shared_prefix_metadata = include_shared_prefix_metadata
         self._pad_token_id = int(pad_token_id)
         self._max_seq_len = int(max_seq_len)
         self._router_replay_enabled = router_replay_enabled
@@ -1131,6 +1135,15 @@ class RolloutReassembler:
         finalized.token_metrics = token_metrics
         return finalized
 
+    def _row_extras(self, rows: Sequence[FinalizedRollout]) -> dict[str, torch.Tensor]:
+        """Extra per-row columns for one group, keyed by :attr:`extra_row_columns`.
+
+        ``rows`` is every row this group publishes, in order, including
+        placeholders and forest execution padding (``valid`` is False on both).
+        The default reassembler publishes no extra columns.
+        """
+        return {}
+
     def _truncated_flags(
         self, rows: Sequence[FinalizedRollout], logical: Optional[_LogicalRows]
     ) -> list[bool]:
@@ -1343,15 +1356,13 @@ class RolloutReassembler:
             assert self._media_columns is not None
             media_fields = _empty_trainer_media(self._media_columns, len(rows))
         train_batch.update(media_fields)
-        if self._include_shared_prefix_metadata:
-            # Keep verified capture boundaries. Invalid placeholders remain exactly
-            # as the baseline produced them and force conventional fallback packing.
-            # The tensor column is the only transport; the driver derives row
-            # tags from it only when work-weighted sharding needs them.
-            train_batch[SHARED_PREFIX_PROMPT_LENGTHS] = torch.tensor(
-                [int(row.prompt_len) if row.valid else 0 for row in rows],
-                dtype=torch.long,
+        extras = self._row_extras(rows)
+        if set(extras) != set(self.extra_row_columns):
+            raise ValueError(
+                f"{type(self).__name__}._row_extras returned {sorted(extras)}, "
+                f"expected {sorted(self.extra_row_columns)}"
             )
+        train_batch.update(extras)
         sample_ids, fields, tags = pack_payload(
             train_batch,
             weight_version=group_min_wv,

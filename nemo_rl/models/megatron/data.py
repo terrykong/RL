@@ -51,7 +51,10 @@ from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
 from nemo_rl.data.packing.algorithms import get_packer
 from nemo_rl.data.packing.shared_prefix_metadata import (
     SHARED_PREFIX_GROUP_ID,
+    SHARED_PREFIX_PARENT,
     SHARED_PREFIX_PROMPT_LENGTHS,
+    SHARED_PREFIX_SLOT,
+    prefix_tree_share_keys,
 )
 from nemo_rl.data_plane.codec import pad_field
 from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS, OPD_FULL_FIELDS
@@ -1059,6 +1062,17 @@ def _build_shared_prefix_rows(
     input_lengths = data_dict["input_lengths"]
     prompt_lengths = data_dict[SHARED_PREFIX_PROMPT_LENGTHS]
     group_ids = data_dict[SHARED_PREFIX_GROUP_ID]
+    if SHARED_PREFIX_SLOT in data_dict and SHARED_PREFIX_PARENT in data_dict:
+        # The reassembler's prefix tree decides who may share: rows only share
+        # within one tree. megatron.rl still checks the prompt tokens match,
+        # and today it builds one level (stars), so deeper links are unused.
+        # Design draft: the presence check keeps the PR's existing GPU tests,
+        # which build batches without the tree; production setup requires it.
+        group_ids = prefix_tree_share_keys(
+            group_ids,
+            data_dict[SHARED_PREFIX_SLOT].tolist(),
+            data_dict[SHARED_PREFIX_PARENT].tolist(),
+        )
     return build_shared_prefix_rows(
         input_ids=input_ids,
         input_lengths=input_lengths,

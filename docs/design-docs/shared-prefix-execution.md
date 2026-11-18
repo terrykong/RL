@@ -21,7 +21,16 @@ NeMo RL translates `BatchedDataDict` fields and the policy configuration into th
 
 The driver and the model workers both need a Megatron-LM build that contains `megatron.rl`. The driver needs it because configuration validation and data-parallel sharding run there. Launch with the Megatron extra, for example `uv run --extra mcore`. Without it, configuration validation raises an `ImportError` that names this requirement.
 
-Prompt boundaries come from the rollout, not from padded tokens. The rollout reassembler writes each row's prompt length as a data-plane column, which is why token capture is required. `TQPolicy` turns that column into row tags for planning.
+Which rows share which tokens comes from the rollout, not from the trainer. `call_selection` picks the calls that train; the rollout reassembler turns them into rows. With `token_capture.reassembler: shared_prefix`, `SharedPrefixRolloutReassembler` also publishes each prompt group's *prefix tree* as four data-plane columns:
+
+| Column | Meaning |
+|---|---|
+| `shared_prefix_prompt_lengths` | Where the row's own context ends (0 for placeholders and forest padding). |
+| `shared_prefix_slot` | The row's position in its group. |
+| `shared_prefix_parent` | The earlier row in the group it shares the most leading tokens with, or -1. |
+| `shared_prefix_shared_len` | How many leading token IDs it shares with that row. |
+
+The tree says nothing about any backend. The rows, rewards, advantages and loss masks are exactly what the default reassembler publishes, so a trainer that ignores the columns runs dense and is still correct. The Megatron worker keys rows by group and tree root, so rows only share within one tree, and `megatron.rl` packs them under the token budget. Today it builds one level (stars); the parent links and shared lengths are there for deeper trees and for other backends. `TQPolicy` turns the prompt-length column into row tags for work-weighted sharding.
 
 `PackedTreeLayout` in Megatron-LM stores physical token spans, logical lengths and parent node indices. Current packing emits only stars and forests. The descriptor can describe deeper trees, but the model backend rejects them. A group with one completion, such as a PPO rollout, keeps its source row and runs densely.
 
@@ -76,7 +85,7 @@ policy:
   quant_cfg: null
 ```
 
-Run it with the single-controller launcher, for example `uv run --extra mcore python examples/run_grpo_single_controller.py --config <recipe>.yaml`. The recipe needs `data_plane.enabled: true` and `token_capture.enabled: true`. Standard GRPO setup rejects the `logprobs` and `train` modes, because it does not produce group identities or prompt lengths.
+Run it with the single-controller launcher, for example `uv run --extra mcore python examples/run_grpo_single_controller.py --config <recipe>.yaml`. The recipe needs `data_plane.enabled: true`, `token_capture.enabled: true` and `token_capture.reassembler: shared_prefix`. Standard GRPO setup rejects the `logprobs` and `train` modes, because it does not produce group identities or a prefix tree.
 
 The commented block in `examples/configs/grpo_math_1B_megatron_single_controller.yaml` lists every key at its default.
 
@@ -110,8 +119,8 @@ The `logprobs` and `train` modes also require the following. Policy and single-c
 - `policy.sequence_packing.enabled` with a deterministic algorithm (not `first_fit_shuffle`) and no `pair_grouping_key`.
 - An explicit `policy.make_sequence_length_divisible_by` that is a multiple of M. Both `train_mb_tokens` and `logprob_mb_tokens` must be multiples of it.
 - `policy.generation.top_p: 1.0` and `top_k` disabled (`null`, `0` or `-1`). Shared logprob extraction does not support top-k/top-p filtering. Temperature scaling is supported.
-- `token_capture.enabled: true`.
-- `token_capture.forest_training: false`. Forest training publishes segment rows and execution-padding rows, which are not shared-prefix completions.
+- `token_capture.enabled: true` and `token_capture.reassembler: shared_prefix` (or a subclass that publishes the same columns).
+- `token_capture.forest_training: false`, for now. The prefix tree already describes forest rows, but group sharding needs every group in a chunk to have the same row count, and forest groups differ. Supporting them needs uneven groups in `plan_group_coherent_shards` and execution-padding rows that run dense with zero loss.
 - `loss_fn.score_centering: false` in `train` mode. Shared training units pass already-extracted logprobs to the loss, so it cannot gather the policy logprobs at the sampler's top-k ids. `logprobs` mode trains densely, so this check does not apply there.
 - `loss_fn.seq_logprob_error_in_loss: false` in `train` mode. The in-loss filter writes its per-row keep flags back in microbatch row order, which shared training units do not keep.
 - `async_rl.rollout_failure.max_skipped_prompts: 0` and `max_consecutive_dropped_prompts: 0`, and `token_capture.min_valid_fraction_per_group` unset. A dropped prompt can leave a step that no longer splits into complete data-parallel groups. A drop that no setting controls (a structural finalizer drop, or a shortfall restored from a checkpoint) and that leaves a step target that is not a multiple of the data-parallel size stops the run at the next chunk selection, before another chunk trains. A shortfall that keeps the target aligned closes the step short, as in dense mode.

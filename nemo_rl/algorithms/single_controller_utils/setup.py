@@ -95,7 +95,7 @@ from nemo_rl.data.multimodal_utils import (
     uses_image_placeholder,
 )
 from nemo_rl.data.packing.shared_prefix_metadata import (
-    SHARED_PREFIX_PROMPT_LENGTHS,
+    SHARED_PREFIX_TREE_COLUMNS,
 )
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
@@ -367,9 +367,20 @@ def _register_single_controller_partitions(
         )
         if master_config.policy["generation"]["top_logprobs"] > 0:
             partition_fields.extend(SAMPLER_TOPK_FIELDS)
-    # setup_single_controller has already required token capture for this.
-    if get_shared_prefix_training_config(policy_config).enabled_for(stage="logprobs"):
-        partition_fields.append(SHARED_PREFIX_PROMPT_LENGTHS)
+    # Whatever extra row columns the configured reassembler publishes. The
+    # shared-prefix reassembler publishes its prefix tree here.
+    if token_capture_cfg.enabled:
+        from nemo_rl.experience.reassembler_registry import (
+            resolve_reassembler_class,
+        )
+
+        partition_fields.extend(
+            field
+            for field in resolve_reassembler_class(
+                token_capture_cfg.reassembler
+            ).extra_row_columns
+            if field not in partition_fields
+        )
     if include_multimodal_fields:
         partition_fields.extend(
             field
@@ -1421,11 +1432,29 @@ def setup_single_controller(
         if not token_capture_cfg.enabled:
             raise ValueError(
                 "policy.shared_prefix_training requires token_capture.enabled=true: "
-                "the rollout reassembler produces the per-row prompt lengths"
+                "the rollout reassembler publishes each group's prefix tree"
             )
-        # Forest training publishes several segment rows and execution-padding
-        # rows per rollout. Shared-prefix sharding and planning expect one row
-        # per sampled completion and never add dummy rows.
+        # The trainer learns which rows share a prefix only from the columns
+        # the reassembler publishes; it never guesses.
+        from nemo_rl.experience.reassembler_registry import (
+            resolve_reassembler_class,
+        )
+
+        missing_columns = set(SHARED_PREFIX_TREE_COLUMNS) - set(
+            resolve_reassembler_class(token_capture_cfg.reassembler).extra_row_columns
+        )
+        if missing_columns:
+            raise ValueError(
+                "policy.shared_prefix_training needs a reassembler that publishes "
+                f"the prefix tree columns {sorted(missing_columns)}; set "
+                "token_capture.reassembler=shared_prefix"
+            )
+        # The prefix tree already describes forest rows (compaction segments and
+        # branch paths). What still blocks them: megatron.rl's group sharding
+        # needs every group in a chunk to have the same row count, and forest
+        # groups differ (segments per rollout vary, plus execution padding).
+        # Lift this check once plan_group_coherent_shards accepts uneven groups
+        # and execution-padding rows run dense with zero loss.
         if token_capture_cfg.forest_training:
             raise ValueError(
                 "policy.shared_prefix_training does not support "
@@ -2447,7 +2476,7 @@ def setup_single_controller(
                 max_seq_len=_generation_max_seq_len(generation_config),
                 capture_media=capture_media,
                 media_columns=media_columns,
-                include_shared_prefix_metadata=shared_prefix_enabled,
+                reassembler=token_capture_cfg.reassembler,
                 effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config
