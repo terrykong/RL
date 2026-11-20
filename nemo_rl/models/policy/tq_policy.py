@@ -43,6 +43,7 @@ import ray
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data.packing.shared_prefix_metadata import (
     SHARED_PREFIX_PROMPT_LENGTHS,
+    SHARED_PREFIX_TREE_COLUMNS,
     with_prompt_length_tags,
 )
 from nemo_rl.data_plane import (
@@ -210,13 +211,13 @@ class TQPolicy(TQDriverMixin, Policy):
         *,
         stage: Literal["train", "logprobs"],
     ) -> tuple[str, ...]:
-        """Add opt-in metadata fields while preserving disabled-mode schemas."""
-        if (
-            self.shared_prefix_training_config.enabled_for(stage=stage)
-            and SHARED_PREFIX_PROMPT_LENGTHS not in fields
-        ):
-            return (*fields, SHARED_PREFIX_PROMPT_LENGTHS)
-        return fields
+        """Add the prefix-tree columns while preserving disabled-mode schemas."""
+        if not self.shared_prefix_training_config.enabled_for(stage=stage):
+            return fields
+        return (
+            *fields,
+            *(field for field in SHARED_PREFIX_TREE_COLUMNS if field not in fields),
+        )
 
     def _with_shared_work_metadata(
         self, meta: KVBatchMeta, *, stage: Literal["train", "logprobs"]

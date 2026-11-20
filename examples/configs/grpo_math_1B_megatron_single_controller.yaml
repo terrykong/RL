@@ -205,7 +205,7 @@ policy:
   # hybrid models; see docs/design-docs/shared-prefix-execution.md, which also
   # lists the rejected model settings. Omitting the block is the same as
   # mode: disabled, and every key below is shown at its default. Enabled modes
-  # require this single-controller launcher with token_capture.enabled=true and
+  # require this single-controller launcher with token_capture.enabled=true,
   # token_capture.forest_training=false, the Megatron backend with megatron.rl
   # importable in the driver environment (uv run --extra mcore), sequence
   # packing with a deterministic algorithm (not first_fit_shuffle) and no

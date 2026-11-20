@@ -30,7 +30,13 @@ from typing import Any
 import pytest
 import torch
 
-from nemo_rl.data.packing.shared_prefix_metadata import SHARED_PREFIX_PROMPT_LENGTHS
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_PARENT,
+    SHARED_PREFIX_PROMPT_LENGTHS,
+    SHARED_PREFIX_SHARED_LEN,
+    SHARED_PREFIX_SLOT,
+    SHARED_PREFIX_TREE_COLUMNS,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
@@ -263,26 +269,17 @@ class _RecordingDataPlane:
         self.fields[partition_id] = list(fields)
 
 
-@pytest.mark.parametrize(
-    "mode, registered",
-    [
-        (None, False),
-        ("disabled", False),
-        ("dense", False),
-        ("logprobs", True),
-        ("train", True),
-    ],
-)
-def test_rollout_partition_carries_prompt_lengths_only_when_sharing(mode, registered):
+def test_rollout_partition_always_carries_the_prefix_tree_columns():
+    # The reassembler writes these columns on every row, whatever the packing,
+    # so the partition registers them with shared prefix off too.
     from nemo_rl.algorithms.single_controller_utils.setup import (
         _register_single_controller_partitions,
     )
+    from nemo_rl.data.packing.shared_prefix_metadata import SHARED_PREFIX_TREE_COLUMNS
     from tests.unit.single_controller.test_setup import _make_master_config
 
     master_config = _make_master_config()
     master_config.token_capture.enabled = True
-    if mode is not None:
-        master_config.policy["shared_prefix_training"] = {"mode": mode}
     data_plane = _RecordingDataPlane()
 
     _register_single_controller_partitions(
@@ -293,8 +290,8 @@ def test_rollout_partition_carries_prompt_lengths_only_when_sharing(mode, regist
     )
 
     rollout_fields = data_plane.fields["rollout_data"]
-    assert (SHARED_PREFIX_PROMPT_LENGTHS in rollout_fields) is registered
-    assert rollout_fields.count(SHARED_PREFIX_PROMPT_LENGTHS) <= 1
+    for column in SHARED_PREFIX_TREE_COLUMNS:
+        assert rollout_fields.count(column) == 1
 
 
 _STAGING_PARTITION = "rollout_staging_shared_prefix_test"
@@ -309,7 +306,7 @@ _CANONICAL_FIELDS = [
     "total_reward",
     "mask_sample",
     "truncated",
-    SHARED_PREFIX_PROMPT_LENGTHS,
+    *SHARED_PREFIX_TREE_COLUMNS,
 ]
 
 
@@ -351,7 +348,6 @@ def test_reassembler_publishes_prompt_lengths_and_group_tags(tq_client):
             staging_partition=_STAGING_PARTITION,
             pad_token_id=0,
             max_seq_len=4096,
-            include_shared_prefix_metadata=True,
         )
 
         finalized = reassembler.finalize_group(
@@ -375,12 +371,19 @@ def test_reassembler_publishes_prompt_lengths_and_group_tags(tq_client):
         published = tq_client.get_samples(
             sample_ids=rollout_ids,
             partition_id=_CANONICAL_PARTITION,
-            select_fields=[SHARED_PREFIX_PROMPT_LENGTHS],
+            select_fields=list(SHARED_PREFIX_TREE_COLUMNS),
         )
-        prompt_lengths = torch.as_tensor(published[SHARED_PREFIX_PROMPT_LENGTHS])
+
+        def column(name):
+            return torch.as_tensor(published[name]).flatten().tolist()
+
         # The verified capture boundary for the valid row; 0 forces the
         # placeholder onto the conventional fallback path.
-        assert prompt_lengths.flatten().tolist() == [expected.prompt_len, 0]
+        assert column(SHARED_PREFIX_PROMPT_LENGTHS) == [expected.prompt_len, 0]
+        # A placeholder is never linked into the prefix tree.
+        assert column(SHARED_PREFIX_SLOT) == [0, 1]
+        assert column(SHARED_PREFIX_PARENT) == [-1, -1]
+        assert column(SHARED_PREFIX_SHARED_LEN) == [0, 0]
     finally:
         tq_client.clear_samples(sample_ids=None, partition_id=_STAGING_PARTITION)
         tq_client.clear_samples(sample_ids=None, partition_id=_CANONICAL_PARTITION)
