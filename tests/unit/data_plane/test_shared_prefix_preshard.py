@@ -269,15 +269,9 @@ class _RecordingDataPlane:
         self.fields[partition_id] = list(fields)
 
 
-@pytest.mark.parametrize(
-    "reassembler, registered",
-    [("default", False), ("shared_prefix", True)],
-)
-def test_rollout_partition_carries_the_reassemblers_extra_columns(
-    reassembler, registered
-):
-    # The partition schema follows the configured reassembler, not the policy
-    # mode: the reassembler is what writes the columns.
+def test_rollout_partition_always_carries_the_prefix_tree_columns():
+    # The reassembler writes these columns on every row, whatever the packing,
+    # so the partition registers them with shared prefix off too.
     from nemo_rl.algorithms.single_controller_utils.setup import (
         _register_single_controller_partitions,
     )
@@ -286,7 +280,6 @@ def test_rollout_partition_carries_the_reassemblers_extra_columns(
 
     master_config = _make_master_config()
     master_config.token_capture.enabled = True
-    master_config.token_capture.reassembler = reassembler
     data_plane = _RecordingDataPlane()
 
     _register_single_controller_partitions(
@@ -298,9 +291,7 @@ def test_rollout_partition_carries_the_reassemblers_extra_columns(
 
     rollout_fields = data_plane.fields["rollout_data"]
     for column in SHARED_PREFIX_TREE_COLUMNS:
-        assert (column in rollout_fields) is registered
-        assert rollout_fields.count(column) <= 1
-    assert (SHARED_PREFIX_PROMPT_LENGTHS in rollout_fields) is registered
+        assert rollout_fields.count(column) == 1
 
 
 _STAGING_PARTITION = "rollout_staging_shared_prefix_test"
@@ -323,9 +314,7 @@ _CANONICAL_FIELDS = [
 def test_reassembler_publishes_prompt_lengths_and_group_tags(tq_client):
     pytest.importorskip("nemo_gym.token_id_capture.staging")
     from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS, TQTokenSink
-    from nemo_rl.experience.shared_prefix_reassembler import (
-        SharedPrefixRolloutReassembler,
-    )
+    from nemo_rl.experience.rollout_reassembler import RolloutReassembler
     from tests.unit.data_plane.token_capture_test_fixtures import (
         build_fixture_artifacts,
     )
@@ -353,7 +342,7 @@ def test_reassembler_publishes_prompt_lengths_and_group_tags(tq_client):
             assert sink.stage(record).ok
         receipt = receipt.model_dump()
         receipt["rollout_id"] = rollout_ids[0]
-        reassembler = SharedPrefixRolloutReassembler(
+        reassembler = RolloutReassembler(
             tq_client,
             partition_id=_CANONICAL_PARTITION,
             staging_partition=_STAGING_PARTITION,

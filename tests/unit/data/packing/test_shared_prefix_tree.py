@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The backend-neutral prefix tree a shared-prefix reassembler publishes."""
+"""The backend-neutral prefix tree the rollout reassembler writes on every row."""
 
 from dataclasses import dataclass
 
@@ -26,6 +26,7 @@ from nemo_rl.data.packing.shared_prefix_metadata import (
     SHARED_PREFIX_TREE_COLUMNS,
     build_prefix_tree,
     prefix_tree_share_keys,
+    shared_prefix_columns,
 )
 
 P = [7, 7, 7, 7]  # the group's prompt
@@ -84,40 +85,29 @@ class _Row:
     valid: bool
 
 
-def test_shared_prefix_reassembler_publishes_exactly_the_tree_columns():
-    from nemo_rl.experience.reassembler_registry import resolve_reassembler_class
-
-    cls = resolve_reassembler_class("shared_prefix")
-    assert cls.extra_row_columns == SHARED_PREFIX_TREE_COLUMNS
+def test_shared_prefix_columns_cover_every_row():
     rows = [_Row(P + [5], 4, True), _Row(P + [6], 4, True), _Row(P, 0, False)]
-    # _row_extras reads only its argument, so no data-plane client is needed.
-    extras = cls._row_extras(object.__new__(cls), rows)
-    assert set(extras) == set(SHARED_PREFIX_TREE_COLUMNS)
-    assert extras[SHARED_PREFIX_PROMPT_LENGTHS].tolist() == [4, 4, 0]
-    assert extras[SHARED_PREFIX_SLOT].tolist() == [0, 1, 2]
-    assert extras[SHARED_PREFIX_PARENT].tolist() == [-1, 0, -1]
-    assert extras[SHARED_PREFIX_SHARED_LEN].tolist() == [0, 4, 0]
-    assert all(t.dtype == torch.long for t in extras.values())
+    cols = shared_prefix_columns(
+        [r.token_ids for r in rows],
+        [r.prompt_len for r in rows],
+        [r.valid for r in rows],
+    )
+    assert set(cols) == set(SHARED_PREFIX_TREE_COLUMNS)
+    assert cols[SHARED_PREFIX_PROMPT_LENGTHS].tolist() == [4, 4, 0]
+    assert cols[SHARED_PREFIX_SLOT].tolist() == [0, 1, 2]
+    assert cols[SHARED_PREFIX_PARENT].tolist() == [-1, 0, -1]
+    assert cols[SHARED_PREFIX_SHARED_LEN].tolist() == [0, 4, 0]
+    assert all(t.dtype == torch.long for t in cols.values())
 
 
-def test_default_reassembler_publishes_no_extra_columns():
-    from nemo_rl.experience.reassembler_registry import resolve_reassembler_class
-
-    cls = resolve_reassembler_class("default")
-    assert cls.extra_row_columns == ()
-    assert cls._row_extras(object.__new__(cls), []) == {}
-
-
-@pytest.mark.parametrize("name", ["nope", "pkg.mod:", ":Cls", "pkg.mod:not an id"])
-def test_reassembler_names_are_checked_without_importing(name):
-    from nemo_rl.experience.reassembler_registry import check_reassembler_name
-
-    with pytest.raises(ValueError, match="Unknown token_capture.reassembler"):
-        check_reassembler_name(name)
+@pytest.mark.parametrize("split", [0, 1, 255, 256, 257, 1000, 5000])
+def test_prefix_length_is_exact_across_chunk_boundaries(split):
+    a = list(range(6000))
+    b = a[:split] + [-1] + a[split + 1 :]
+    _, shared = build_prefix_tree([a, b], [True, True])
+    assert shared == [0, split]
 
 
-def test_a_custom_reassembler_must_subclass_rolloutreassembler():
-    from nemo_rl.experience.reassembler_registry import resolve_reassembler_class
-
-    with pytest.raises(ValueError, match="not a RolloutReassembler subclass"):
-        resolve_reassembler_class("collections:OrderedDict")
+def test_identical_rows_share_their_full_length():
+    _, shared = build_prefix_tree([[1, 2, 3], [1, 2, 3], [1, 2]], [True, True, True])
+    assert shared == [0, 3, 2]

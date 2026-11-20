@@ -29,7 +29,6 @@ from nemo_rl.distributed.actor_environments import (
     NEMO_GYM_ACTOR_FQN,
     ROLLOUT_REASSEMBLER_ACTOR_FQN,
 )
-from nemo_rl.experience.reassembler_registry import resolve_reassembler_class
 from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 from nemo_rl.experience.rollout_reassembler import (
     FinalizedGroup,
@@ -146,8 +145,6 @@ class RolloutReassemblerActorConfig:
     # media rows in this geometry for groups without media), ``None`` otherwise.
     media_columns: Optional[MediaColumnSpec]
     top_logprobs: int
-    # token_capture.reassembler: a built-in name or package.module:Class.
-    reassembler: str
     reward_penalty_config: RewardPenaltyConfig | None = None
     effort_config: EffortLevelsConfig | None = None
     # Policy tokenizer and resolved think tags, set only when
@@ -178,8 +175,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             from nemo_rl.algorithms.utils import get_tokenizer
 
             tokenizer = get_tokenizer(config.tokenizer_config)
-        reassembler_cls = resolve_reassembler_class(config.reassembler)
-        self._finalizer = reassembler_cls(
+        self._finalizer = RolloutReassembler(
             self._dp_client,
             partition_id=config.partition_id,
             staging_partition=config.staging_partition,

@@ -28,6 +28,7 @@ from collections.abc import Hashable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
+import torch
 
 __all__ = [
     "SHARED_PREFIX_GROUP_ID",
@@ -60,6 +61,23 @@ SHARED_PREFIX_TREE_COLUMNS = (
 )
 
 
+def _common_prefix_len(a: np.ndarray, b: np.ndarray) -> int:
+    """Count the leading tokens two rows share, stopping near the first difference.
+
+    Rows in a group usually differ right after the prompt, so comparing in
+    doubling chunks costs about the shared length, not the full row length.
+    """
+    limit = min(len(a), len(b))
+    start, step = 0, 256
+    while start < limit:
+        end = min(limit, start + step)
+        differ = np.flatnonzero(a[start:end] != b[start:end])
+        if differ.size:
+            return start + int(differ[0])
+        start, step = end, step * 2
+    return limit
+
+
 def build_prefix_tree(
     token_ids: Sequence[Sequence[int]],
     valid: Sequence[bool],
@@ -90,10 +108,7 @@ def build_prefix_tree(
             for earlier in range(index):
                 if not valid[earlier]:
                     continue
-                other = rows[earlier]
-                limit = min(len(row), len(other))
-                differ = np.flatnonzero(row[:limit] != other[:limit])
-                common = int(differ[0]) if differ.size else limit
+                common = _common_prefix_len(row, rows[earlier])
                 if common > best_len:
                     best_parent, best_len = earlier, common
         parents.append(best_parent)
@@ -164,3 +179,30 @@ def with_prompt_length_tags(
             raise ValueError("Prompt length tag disagrees with its tensor field")
         tag[SHARED_PREFIX_PROMPT_LENGTHS] = prefix
     return result
+
+
+def shared_prefix_columns(
+    token_ids: Sequence[Sequence[int]],
+    prompt_lens: Sequence[int],
+    valid: Sequence[bool],
+) -> dict[str, torch.Tensor]:
+    """Build one prompt group's prefix-tree columns, one value per row.
+
+    The rollout reassembler writes these on every row, whatever the trainer's
+    packing. Only shared-prefix packing reads them today; other consumers
+    (value model, teachers, dense packing) ignore them. They cost four int64s
+    per row, so there is no switch.
+
+    Placeholders and forest execution padding (``valid`` False) get prompt
+    length 0 and no parent, so they always run dense.
+    """
+    parents, shared_lens = build_prefix_tree(token_ids, valid)
+    return {
+        SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor(
+            [int(n) if ok else 0 for n, ok in zip(prompt_lens, valid, strict=True)],
+            dtype=torch.long,
+        ),
+        SHARED_PREFIX_SLOT: torch.arange(len(token_ids), dtype=torch.long),
+        SHARED_PREFIX_PARENT: torch.tensor(parents, dtype=torch.long),
+        SHARED_PREFIX_SHARED_LEN: torch.tensor(shared_lens, dtype=torch.long),
+    }

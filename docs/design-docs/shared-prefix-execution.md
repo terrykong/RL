@@ -21,7 +21,7 @@ NeMo RL translates `BatchedDataDict` fields and the policy configuration into th
 
 The driver and the model workers both need a Megatron-LM build that contains `megatron.rl`. The driver needs it because configuration validation and data-parallel sharding run there. Launch with the Megatron extra, for example `uv run --extra mcore`. Without it, configuration validation raises an `ImportError` that names this requirement.
 
-Which rows share which tokens comes from the rollout, not from the trainer. `call_selection` picks the calls that train; the rollout reassembler turns them into rows. With `token_capture.reassembler: shared_prefix`, `SharedPrefixRolloutReassembler` also publishes each prompt group's *prefix tree* as four data-plane columns:
+Which rows share which tokens comes from the rollout, not from the trainer. `call_selection` picks the calls that train; the rollout reassembler turns them into rows. It also writes each prompt group's *prefix tree* as four data-plane columns, on every row and whatever the packing, so it needs no packing setting:
 
 | Column | Meaning |
 |---|---|
@@ -85,7 +85,7 @@ policy:
   quant_cfg: null
 ```
 
-Run it with the single-controller launcher, for example `uv run --extra mcore python examples/run_grpo_single_controller.py --config <recipe>.yaml`. The recipe needs `data_plane.enabled: true`, `token_capture.enabled: true` and `token_capture.reassembler: shared_prefix`. Standard GRPO setup rejects the `logprobs` and `train` modes, because it does not produce group identities or a prefix tree.
+Run it with the single-controller launcher, for example `uv run --extra mcore python examples/run_grpo_single_controller.py --config <recipe>.yaml`. The recipe needs `data_plane.enabled: true`, `token_capture.enabled: true`. Standard GRPO setup rejects the `logprobs` and `train` modes, because it does not produce group identities or a prefix tree.
 
 The commented block in `examples/configs/grpo_math_1B_megatron_single_controller.yaml` lists every key at its default.
 
@@ -119,7 +119,7 @@ The `logprobs` and `train` modes also require the following. Policy and single-c
 - `policy.sequence_packing.enabled` with a deterministic algorithm (not `first_fit_shuffle`) and no `pair_grouping_key`.
 - An explicit `policy.make_sequence_length_divisible_by` that is a multiple of M. Both `train_mb_tokens` and `logprob_mb_tokens` must be multiples of it.
 - `policy.generation.top_p: 1.0` and `top_k` disabled (`null`, `0` or `-1`). Shared logprob extraction does not support top-k/top-p filtering. Temperature scaling is supported.
-- `token_capture.enabled: true` and `token_capture.reassembler: shared_prefix` (or a subclass that publishes the same columns).
+- `token_capture.enabled: true`.
 - `token_capture.forest_training: false`, for now. The prefix tree already describes forest rows, but group sharding needs every group in a chunk to have the same row count, and forest groups differ. Supporting them needs uneven groups in `plan_group_coherent_shards` and execution-padding rows that run dense with zero loss.
 - `loss_fn.score_centering: false` in `train` mode. Shared training units pass already-extracted logprobs to the loss, so it cannot gather the policy logprobs at the sampler's top-k ids. `logprobs` mode trains densely, so this check does not apply there.
 - `loss_fn.seq_logprob_error_in_loss: false` in `train` mode. The in-loss filter writes its per-row keep flags back in microbatch row order, which shared training units do not keep.

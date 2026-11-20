@@ -64,7 +64,6 @@ from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
 )
 from nemo_rl.environments.call_selection import resolve_selection_policy
-from nemo_rl.experience.reassembler_registry import check_reassembler_name
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.environments.nemo_gym_task import (
     get_nemo_gym_attribution_key,
@@ -707,15 +706,10 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # all_captured includes every captured call, including abandoned attempts.
     # Custom policies use an importable package.module:function path.
     selection_policy: str = "returned_history"
-    # Which RolloutReassembler turns selected calls into rows: "default", or
-    # "shared_prefix", which also publishes each group's prefix tree (needed by
-    # policy.shared_prefix_training), or an importable package.module:Class.
-    reassembler: str = "default"
 
     @model_validator(mode="after")
     def validate_selection_policy(self) -> "TokenCaptureConfig":
         resolve_selection_policy(self.selection_policy)
-        check_reassembler_name(self.reassembler)
         if self.selection_policy != "returned_history" and not self.forest_training:
             raise ValueError(
                 f"selection_policy={self.selection_policy} requires forest_training=true"

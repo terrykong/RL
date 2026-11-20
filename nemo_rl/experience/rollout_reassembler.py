@@ -40,7 +40,7 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field, replace
 from graphlib import CycleError, TopologicalSorter
-from typing import TYPE_CHECKING, Any, ClassVar, Optional, cast
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
 
@@ -50,6 +50,7 @@ from nemo_rl.data.captured_media import (
     verify_media_geometry,
 )
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.packing.shared_prefix_metadata import shared_prefix_columns
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
@@ -371,16 +372,7 @@ def _media_fields_for_group(rows: list[FinalizedRollout]) -> dict[str, PackedTen
 
 
 class RolloutReassembler:
-    """Receipts -> verified rows -> N-row publish, off the generation hot path.
-
-    Subclasses add per-row columns by setting :attr:`extra_row_columns` and
-    overriding :meth:`_row_extras`. ``token_capture.reassembler`` picks the
-    class (see :mod:`nemo_rl.experience.reassembler_registry`), and setup adds
-    the columns to the partition schema.
-    """
-
-    # Names of the extra per-row tensor columns :meth:`_row_extras` returns.
-    extra_row_columns: ClassVar[tuple[str, ...]] = ()
+    """Receipts -> verified rows -> N-row publish, off the generation hot path."""
 
     def __init__(
         self,
@@ -1135,15 +1127,6 @@ class RolloutReassembler:
         finalized.token_metrics = token_metrics
         return finalized
 
-    def _row_extras(self, rows: Sequence[FinalizedRollout]) -> dict[str, torch.Tensor]:
-        """Extra per-row columns for one group, keyed by :attr:`extra_row_columns`.
-
-        ``rows`` is every row this group publishes, in order, including
-        placeholders and forest execution padding (``valid`` is False on both).
-        The default reassembler publishes no extra columns.
-        """
-        return {}
-
     def _truncated_flags(
         self, rows: Sequence[FinalizedRollout], logical: Optional[_LogicalRows]
     ) -> list[bool]:
@@ -1356,13 +1339,16 @@ class RolloutReassembler:
             assert self._media_columns is not None
             media_fields = _empty_trainer_media(self._media_columns, len(rows))
         train_batch.update(media_fields)
-        extras = self._row_extras(rows)
-        if set(extras) != set(self.extra_row_columns):
-            raise ValueError(
-                f"{type(self).__name__}._row_extras returned {sorted(extras)}, "
-                f"expected {sorted(self.extra_row_columns)}"
+        # Which rows share leading tokens, for shared-prefix packing. Written on
+        # every row whatever the packing, so this class needs no packing setting;
+        # other consumers ignore the four int64 columns.
+        train_batch.update(
+            shared_prefix_columns(
+                [row.token_ids for row in rows],
+                [row.prompt_len for row in rows],
+                [row.valid for row in rows],
             )
-        train_batch.update(extras)
+        )
         sample_ids, fields, tags = pack_payload(
             train_batch,
             weight_version=group_min_wv,

@@ -277,26 +277,11 @@ def test_shared_prefix_rejects_streaming_ppo_before_allocating_workers(
     mc.ppo.adv_estimator.normalize_advantages = False
     mc.policy["shared_prefix_training"] = {"mode": "train"}
     mc.token_capture.enabled = True
-    mc.token_capture.reassembler = "shared_prefix"
 
     with pytest.raises(ValueError, match="does not support streaming PPO"):
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     patched_ppo_factories["_build_clusters"].assert_not_called()
-
-
-def test_shared_prefix_requires_the_prefix_tree_reassembler(
-    patched_factories,  # noqa: F811
-):
-    # The trainer learns who shares a prefix only from the reassembler's columns.
-    mc = _make_master_config(sampler_cfg=InOrderSamplerConfig())
-    mc.policy["shared_prefix_training"] = {"mode": "logprobs"}
-    mc.token_capture.enabled = True
-
-    with pytest.raises(ValueError, match="token_capture.reassembler=shared_prefix"):
-        setup_single_controller(mc, MagicMock(pad_token_id=0))
-
-    patched_factories["_build_clusters"].assert_not_called()
 
 
 def test_shared_prefix_rejects_streaming_weight_fifo_before_allocating_workers(
@@ -309,7 +294,6 @@ def test_shared_prefix_rejects_streaming_weight_fifo_before_allocating_workers(
     mc.async_rl.min_groups_for_streaming_train = 2
     mc.policy["shared_prefix_training"] = {"mode": "train"}
     mc.token_capture.enabled = True
-    mc.token_capture.reassembler = "shared_prefix"
 
     with pytest.raises(ValueError, match="does not support the weight_fifo sampler"):
         setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -323,7 +307,6 @@ def test_shared_prefix_rejects_min_valid_fraction_before_allocating_workers(
     mc = _make_master_config(sampler_cfg=InOrderSamplerConfig())
     mc.policy["shared_prefix_training"] = {"mode": "train"}
     mc.token_capture.enabled = True
-    mc.token_capture.reassembler = "shared_prefix"
     mc.token_capture.min_valid_fraction_per_group = 0.5
 
     with pytest.raises(ValueError, match="min_valid_fraction_per_group"):
@@ -342,7 +325,6 @@ def test_shared_prefix_rejects_drop_budgets_before_allocating_workers(
     mc = _make_master_config(sampler_cfg=InOrderSamplerConfig())
     mc.policy["shared_prefix_training"] = {"mode": "train"}
     mc.token_capture.enabled = True
-    mc.token_capture.reassembler = "shared_prefix"
     setattr(mc.async_rl.rollout_failure, budget, 1)
 
     with pytest.raises(ValueError, match="max_consecutive_dropped_prompts=0"):
@@ -371,7 +353,6 @@ def test_shared_prefix_train_rejects_score_centering_before_allocating_workers(
     )
     mc.policy["shared_prefix_training"] = {"mode": "train"}
     mc.token_capture.enabled = True
-    mc.token_capture.reassembler = "shared_prefix"
 
     with pytest.raises(ValueError, match="does not support loss_fn.score_centering"):
         setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -397,7 +378,6 @@ def test_shared_prefix_train_rejects_in_loss_seq_filter_before_allocating_worker
     )
     mc.policy["shared_prefix_training"] = {"mode": "train"}
     mc.token_capture.enabled = True
-    mc.token_capture.reassembler = "shared_prefix"
 
     with pytest.raises(
         ValueError, match="does not support loss_fn.seq_logprob_error_in_loss"
@@ -422,7 +402,6 @@ def test_shared_prefix_rejects_forest_training_before_allocating_workers(
     mc = _make_master_config(sampler_cfg=InOrderSamplerConfig())
     mc.policy["shared_prefix_training"] = {"mode": "logprobs"}
     mc.token_capture.enabled = True
-    mc.token_capture.reassembler = "shared_prefix"
     mc.token_capture.forest_training = True
 
     with pytest.raises(ValueError, match="token_capture.forest_training=true"):

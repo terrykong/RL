@@ -367,18 +367,11 @@ def _register_single_controller_partitions(
         )
         if master_config.policy["generation"]["top_logprobs"] > 0:
             partition_fields.extend(SAMPLER_TOPK_FIELDS)
-    # Whatever extra row columns the configured reassembler publishes. The
-    # shared-prefix reassembler publishes its prefix tree here.
+    # The reassembler writes the prefix-tree columns on every row.
     if token_capture_cfg.enabled:
-        from nemo_rl.experience.reassembler_registry import (
-            resolve_reassembler_class,
-        )
-
         partition_fields.extend(
             field
-            for field in resolve_reassembler_class(
-                token_capture_cfg.reassembler
-            ).extra_row_columns
+            for field in SHARED_PREFIX_TREE_COLUMNS
             if field not in partition_fields
         )
     if include_multimodal_fields:
@@ -1434,21 +1427,6 @@ def setup_single_controller(
                 "policy.shared_prefix_training requires token_capture.enabled=true: "
                 "the rollout reassembler publishes each group's prefix tree"
             )
-        # The trainer learns which rows share a prefix only from the columns
-        # the reassembler publishes; it never guesses.
-        from nemo_rl.experience.reassembler_registry import (
-            resolve_reassembler_class,
-        )
-
-        missing_columns = set(SHARED_PREFIX_TREE_COLUMNS) - set(
-            resolve_reassembler_class(token_capture_cfg.reassembler).extra_row_columns
-        )
-        if missing_columns:
-            raise ValueError(
-                "policy.shared_prefix_training needs a reassembler that publishes "
-                f"the prefix tree columns {sorted(missing_columns)}; set "
-                "token_capture.reassembler=shared_prefix"
-            )
         # The prefix tree already describes forest rows (compaction segments and
         # branch paths). What still blocks them: megatron.rl's group sharding
         # needs every group in a chunk to have the same row count, and forest
@@ -2476,7 +2454,6 @@ def setup_single_controller(
                 max_seq_len=_generation_max_seq_len(generation_config),
                 capture_media=capture_media,
                 media_columns=media_columns,
-                reassembler=token_capture_cfg.reassembler,
                 effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config

@@ -153,7 +153,6 @@ def test_actor_forwards_capture_media_to_the_reassembler(
         router_replay_enabled=False,
         defer_routed_experts_to_policy=False,
         max_seq_len=4096,
-        reassembler="default",
         top_logprobs=0,
         capture_media=capture_media,
         media_columns=(
@@ -298,7 +297,6 @@ def test_factory_selects_compatible_environment_and_waits_for_dependencies(
         router_replay_enabled=False,
         defer_routed_experts_to_policy=False,
         max_seq_len=4096,
-        reassembler="default",
         capture_media=False,
         media_columns=None,
         top_logprobs=0,
