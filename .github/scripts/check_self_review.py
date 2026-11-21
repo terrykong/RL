@@ -15,10 +15,18 @@
 
 States (shown in the status description):
   No self-review           the author has not published a review made by review-pr-team
-  Not accepted: <reason>   the review's marker names a harness/model/effort or skill
+  Self-review found without the review-pr-team footer
+                           the author has a non-empty review but none with a kind=self footer
+                           (empty-body reviews, which thread replies create, don't count)
+  Not accepted: <reason>   the review's footer names a harness/model/effort or skill
                            revision that skills/review-pr-team/self-review-policy.json rejects
   Not resolved: N of M     some self-review threads have no reply or are not resolved
   Resolved (M threads)     every self-review thread has a reply and is resolved
+
+The footer is the last line in the review body that starts with `nemo-rl-review:` (backticks
+around it are ignored), followed by space-separated key=value pairs, for example
+kind=self harness=claude-code/2.1.330 model=claude-opus-5-5 effort=medium review-pr-team=v2
+reviewed=3672697. Only reviews by the PR author with kind=self count.
 
 Also fails the job when a PR changes skills/review-pr-team/ without bumping its REVISION by one.
 
@@ -40,7 +48,8 @@ from pathlib import Path
 
 CONTEXT = "Self-review"
 SKILL_DIR = "skills/review-pr-team/"
-_MARKER = re.compile(r"<!--\s*nemo-rl-review:\s*(.*?)\s*-->", re.S)
+_FOOTER = re.compile(r"^[ \t`]*nemo-rl-review:[ \t]*(.*?)[ \t`]*$", re.M)
+_REVISION = re.compile(r"v(\d+)")
 
 
 @dataclass
@@ -59,8 +68,8 @@ class Thread:
 
 
 def parse_marker(body: str) -> dict[str, str] | None:
-    """Return the fields of the last `<!-- nemo-rl-review: k=v ... -->` marker in body."""
-    found = _MARKER.findall(body or "")
+    """Return the key=value fields of the last `nemo-rl-review:` footer line in body."""
+    found = _FOOTER.findall(body or "")
     if not found:
         return None
     return dict(part.split("=", 1) for part in found[-1].split() if "=" in part)
@@ -69,7 +78,7 @@ def parse_marker(body: str) -> dict[str, str] | None:
 def not_accepted_reason(
     marker: dict[str, str], policy: dict, main_rev: int
 ) -> str | None:
-    """Why this self-review's marker is rejected, or None if it is accepted."""
+    """Why this self-review's footer is rejected, or None if it is accepted."""
     harness = marker.get("harness", "").split("/", 1)[0]
     models = policy["allowed_models"].get(harness)
     if models is None:
@@ -81,12 +90,14 @@ def not_accepted_reason(
     effort = marker.get("effort", "unknown")
     if effort not in order or order.index(effort) < order.index(policy["min_effort"]):
         return f"effort {effort} is below {policy['min_effort']}"
-    try:
-        rev = int(marker.get("skill_rev", ""))
-    except ValueError:
-        return "no skill revision in the marker"
+    match = _REVISION.fullmatch(marker.get("review-pr-team", ""))
+    if not match:
+        return "no skill revision in the footer"
+    rev = int(match.group(1))
     if main_rev - rev > policy["max_revision_lag"]:
-        return f"review-pr-team rev {rev} is too old (main is {main_rev}); update the skill"
+        return (
+            f"review-pr-team v{rev} is too old (main is v{main_rev}); update the skill"
+        )
     return None
 
 
@@ -106,6 +117,12 @@ def evaluate(
         if r.author == author and (parse_marker(r.body) or {}).get("kind") == "self"
     ]
     if not own:
+        if any(r.author == author and r.body.strip() for r in reviews):
+            return (
+                "failure",
+                "Self-review found without the review-pr-team footer — rerun "
+                f"/review-pr-team {pr_number} in a fresh Claude Code or Codex session",
+            )
         return (
             "failure",
             f"No self-review — run /review-pr-team {pr_number} in a fresh Claude Code or Codex session",
@@ -126,16 +143,16 @@ def evaluate(
 
 
 def revision_bump_problem(
-    changed_files: list[str], main_rev: int, head_rev: int
+    changed_files: list[str], base_rev: int, head_rev: int
 ) -> str | None:
-    """A PR that changes the review skill must bump its REVISION by exactly one."""
+    """A PR that changes the review skill must bump its REVISION by exactly one over its base."""
     if not any(f.startswith(SKILL_DIR) for f in changed_files):
         return None
-    if head_rev == main_rev + 1:
+    if head_rev == base_rev + 1:
         return None
     return (
         f"This PR changes {SKILL_DIR} but {SKILL_DIR}REVISION is {head_rev}; "
-        f"set it to {main_rev + 1} (main is {main_rev})."
+        f"set it to {base_rev + 1} (base is {base_rev})."
     )
 
 
@@ -176,36 +193,57 @@ class GitHub:
 
     def threads(self, number: int) -> list[Thread]:
         owner, name = self.repo.split("/")
-        query = """query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){
-          pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved
-          comments(first:1){totalCount nodes{pullRequestReview{databaseId}}}}}}}}"""
-        data = self.call(
-            "POST",
-            "https://api.github.com/graphql",
-            {
-                "query": query,
-                "variables": {"owner": owner, "name": name, "number": number},
-            },
-        )
-        nodes = data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
-        out = []
-        for n in nodes:
-            first = n["comments"]["nodes"]
-            review = (first[0].get("pullRequestReview") or {}) if first else {}
-            out.append(
-                Thread(
-                    n["isResolved"],
-                    n["comments"]["totalCount"],
-                    review.get("databaseId"),
-                )
+        query = """query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+          repository(owner:$owner,name:$name){pullRequest(number:$number){
+          reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor}
+          nodes{isResolved comments(first:1){totalCount nodes{pullRequestReview{databaseId}}}}}}}}"""
+        out, cursor = [], None
+        while True:
+            data = self.call(
+                "POST",
+                "https://api.github.com/graphql",
+                {
+                    "query": query,
+                    "variables": {
+                        "owner": owner,
+                        "name": name,
+                        "number": number,
+                        "cursor": cursor,
+                    },
+                },
             )
-        return out
+            conn = data["data"]["repository"]["pullRequest"]["reviewThreads"]
+            for n in conn["nodes"]:
+                first = n["comments"]["nodes"]
+                review = (first[0].get("pullRequestReview") or {}) if first else {}
+                out.append(
+                    Thread(
+                        n["isResolved"],
+                        n["comments"]["totalCount"],
+                        review.get("databaseId"),
+                    )
+                )
+            if not conn["pageInfo"]["hasNextPage"]:
+                return out
+            cursor = conn["pageInfo"]["endCursor"]
 
 
 def _read_rev(text: str | None) -> int:
     try:
         return int((text or "").strip())
     except ValueError:
+        return 0
+
+
+def _rev_at(gh: GitHub, ref: str) -> int:
+    """The skill REVISION at a commit, read as data; 0 when the file doesn't exist there."""
+    try:
+        return _read_rev(
+            gh.call("GET", f"/contents/{SKILL_DIR}REVISION?ref={ref}", raw=True)
+        )
+    except urllib.error.HTTPError as err:
+        if err.code != 404:
+            raise
         return 0
 
 
@@ -249,16 +287,11 @@ def main() -> int:
     print(f"{CONTEXT}: {state} — {description}")
 
     changed = [f["filename"] for f in gh.pages(f"/pulls/{number}/files")]
-    head_rev = 0
+    base_rev = head_rev = 0
     if any(f.startswith(SKILL_DIR) for f in changed):
-        try:
-            head_rev = _read_rev(
-                gh.call("GET", f"/contents/{SKILL_DIR}REVISION?ref={head}", raw=True)
-            )
-        except urllib.error.HTTPError as err:
-            if err.code != 404:
-                raise
-    problem = revision_bump_problem(changed, main_rev, head_rev)
+        base_rev = _rev_at(gh, pr["base"]["sha"])
+        head_rev = _rev_at(gh, head)
+    problem = revision_bump_problem(changed, base_rev, head_rev)
     if problem:
         print(f"::error title=review-pr-team REVISION::{problem}")
         return 1
