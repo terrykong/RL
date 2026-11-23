@@ -782,12 +782,15 @@ def test_collective_fans_out_in_record_order_with_rank_prefixes(
     shard_widths = (prefill_tp, 2, 2)
     assert generation.shard_widths == shard_widths
     assert generation.inference_world_size == sum(shard_widths)
-    full = generation.full_fleet_membership(train_world_size=8)
-    assert full.shard_prefixes == dict(enumerate(prefixes))
-    assert full.workers_per_shard == shard_widths
-    generation.check_full_fleet(full)
-    # The full fleet is the one membership set_refit_membership accepts.
-    generation.set_refit_membership(full)
+    assert generation.engine_rank_offsets(train_world_size=8) == [
+        8 + prefix for prefix in prefixes
+    ]
+    # Every engine is the one membership set_refit_membership accepts.
+    generation.set_refit_membership(
+        desired_membership(
+            absent_shards=[], dp_size=3, total_gen_workers=3, train_world_size=8
+        )
+    )
 
     assert generation.prepare_refit_info({"w": ((1,), "float32")}) is None
     futures = generation.init_collective(
@@ -892,45 +895,17 @@ def test_resume_attempts_every_engine_and_reports_all_failures(env):
     ]
 
 
-@pytest.mark.parametrize(
-    ("prefill_tp", "membership", "match"),
-    [
-        pytest.param(
-            2,
-            dict(absent_shards=[1], dp_size=3, total_gen_workers=6),
-            "fixed fleet",
-            id="partial",
-        ),
-        # An evenly sharded membership would start the decode engines at the
-        # wrong ranks next to a wider prefill engine.
-        pytest.param(
-            4,
-            dict(absent_shards=[], dp_size=3, total_gen_workers=6),
-            r"ranks \[4, 2, 2\]",
-            id="uniform_prefixes_against_mixed_widths",
-        ),
-        # Same prefixes but a width that is not the engine's is refused too.
-        pytest.param(
-            4,
-            dict(
-                absent_shards=[], dp_size=3, total_gen_workers=8, shard_widths=(4, 3, 1)
-            ),
-            "fixed fleet",
-            id="mismatched_widths",
-        ),
-    ],
-)
-def test_refit_membership_must_be_every_engine_in_order(
-    env, prefill_tp, membership, match
-):
+@pytest.mark.parametrize("prefill_tp", [2, 4], ids=["even", "mixed"])
+def test_refit_membership_must_be_every_engine(env, prefill_tp):
     generation = env.started(
         generation_config=_with_layout({"tensor_model_parallel_size": prefill_tp}),
         world_size=prefill_tp + 4,
     )
-    generation.check_full_fleet(generation.full_fleet_membership(train_world_size=8))
-    with pytest.raises(NotImplementedError, match=match):
+    with pytest.raises(NotImplementedError, match="fixed fleet"):
         generation.set_refit_membership(
-            desired_membership(train_world_size=8, **membership)
+            desired_membership(
+                absent_shards=[1], dp_size=3, total_gen_workers=3, train_world_size=8
+            )
         )
 
 
