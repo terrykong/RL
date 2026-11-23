@@ -21,6 +21,7 @@ rank order, and is their refit side.
 
 import copy
 import dataclasses
+import itertools
 import logging
 import time
 import uuid
@@ -54,7 +55,7 @@ from nemo_rl.models.generation.megatron.megatron_generation import MegatronGener
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
-from nemo_rl.weight_sync.membership import RefitMembership, desired_membership
+from nemo_rl.weight_sync.membership import RefitMembership
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -272,10 +273,9 @@ class MegatronDynamoGeneration(GenerationInterface):
     This object is also the engines' refit side: every refit call the trainer
     makes here (collective init, prepare the weights, transfer, suspend,
     prepare the KV cache, resume) is fanned out over the engines' Ray workers
-    in engine order. Rank placement comes from the shared ``RefitMembership``
-    arithmetic: engine ``i`` starts at the trainers plus the widths of the
-    engines before it, so a prefill engine at TP 4 may sit next to decode
-    engines at TP 2. After a failed suspend the fleet attempts a best-effort
+    in engine order. Engine ``i`` starts at the trainers plus the widths of the
+    engines before it (``engine_rank_offsets``), so a prefill engine at TP 4
+    may sit next to decode engines at TP 2. After a failed suspend the fleet attempts a best-effort
     resume of every engine and the original error still propagates. The object
     owns no policy and no worker group of its own.
 
@@ -528,36 +528,13 @@ class MegatronDynamoGeneration(GenerationInterface):
     # ------------------------------------------------------------------
 
     def check_full_fleet(self, membership: RefitMembership) -> None:
-        """Reject any membership but every engine, in order: the engine set is fixed.
-
-        Engine ``i``'s prefix is the sum of the widths before it, and its width
-        must be the one its record reports.
-        """
-        widths = self.shard_widths
-        full_fleet: dict[int, int] = {}
-        prefix = 0
-        for index, width in enumerate(widths):
-            full_fleet[index] = prefix
-            prefix += width
-        if (
-            membership.shard_prefixes != full_fleet
-            or membership.workers_per_shard != widths
-        ):
+        """Reject any membership but every engine: the engine set is fixed."""
+        engines = list(range(self.num_engines))
+        if sorted(membership.shard_prefixes) != engines:
             raise NotImplementedError(
                 "Megatron engines behind Dynamo are a fixed fleet; refit membership "
-                f"must be every engine {full_fleet} with ranks {list(widths)}, got "
-                f"{membership.shard_prefixes} with {list(membership.workers_per_shard)}."
+                f"must be every engine {engines}, got {sorted(membership.shard_prefixes)}."
             )
-
-    def full_fleet_membership(self, train_world_size: int) -> RefitMembership:
-        """Every engine, each a DP shard of its own TP x PP ranks after the trainers."""
-        return desired_membership(
-            absent_shards=[],
-            dp_size=self.num_engines,
-            total_gen_workers=self.inference_world_size,
-            train_world_size=train_world_size,
-            shard_widths=self.shard_widths,
-        )
 
     def set_refit_membership(self, membership: RefitMembership) -> None:
         """Check the membership; the engine set is fixed, so it must be every engine.
@@ -597,7 +574,6 @@ class MegatronDynamoGeneration(GenerationInterface):
                 f"NCCL world_size={world_size} does not match expected {expected} "
                 f"(train={train_world_size} + engines={self.inference_world_size})"
             )
-        self.check_full_fleet(self.full_fleet_membership(train_world_size))
         offsets = self.engine_rank_offsets(train_world_size)
         futures: list[ray.ObjectRef] = []
         if self.uses_native_refit:
@@ -634,11 +610,8 @@ class MegatronDynamoGeneration(GenerationInterface):
         The trainers take ranks ``0 .. train_world_size - 1``; engine ``i``
         starts right after the trainers and the engines before it.
         """
-        membership = self.full_fleet_membership(train_world_size)
-        return [
-            membership.train_world_size + membership.shard_prefixes[index]
-            for index in range(self.num_engines)
-        ]
+        starts = itertools.accumulate(self.shard_widths, initial=train_world_size)
+        return list(starts)[:-1]
 
     def prepare_refit_info(
         self, state_dict_info: Optional[dict[str, Any]]
