@@ -18,7 +18,9 @@
 request kinds served, how errors reach the driver, and the endpoint's
 registration. A backend implements four methods over its worker's engine
 (``serve_rollout``, ``start``, ``abort`` and ``kv_event_sources``);
-``vllm.adapter.DynamoVllmAdapter`` is the vLLM one. The engine only ever receives
+``vllm.adapter.DynamoVllmAdapter`` is the vLLM one. A backend that splits
+prefill and decode across engines also implements ``serve_prefill`` and
+``release_handoff``, and its decode ``serve_rollout`` takes the prefill's handoff. The engine only ever receives
 token IDs: NeMo RL's rollouts on ``/v1/completions``, and NeMo-Gym's chat calls
 once NeMo RL's chat engine in the frontend has rendered them. This module imports no generation backend.
 """
@@ -42,7 +44,9 @@ from dynamo.common.backend import (
     Worker,
     WorkerConfig,
 )
+from dynamo.common.backend.disagg import require_prefill_result
 from dynamo.common.backend.publisher import KvEventSource
+from dynamo.common.constants import DisaggregationMode
 from dynamo.llm.exceptions import InvalidArgument
 
 from nemo_rl.models.generation.dynamo.managed_runtime import (
@@ -59,6 +63,10 @@ from nemo_rl.models.generation.rollout_result import (
 RequestHandler = Callable[
     [GenerateRequest, str, Context], AsyncGenerator[GenerateChunk, None]
 ]
+
+# What a prefill engine hands its decode peer: Dynamo's ``disaggregated_params``,
+# which only the backend reads.
+Handoff = dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -83,10 +91,18 @@ def _annotation_value(request: GenerateRequest, prefix: str) -> Optional[str]:
 class DynamoEngineAdapter(LLMEngine):
     """Serves one NeMo RL generation worker through Dynamo. The worker owns the engine."""
 
-    def __init__(self, *, leader_worker_idx: int):
+    def __init__(
+        self,
+        *,
+        leader_worker_idx: int,
+        disaggregation_mode: DisaggregationMode = DisaggregationMode.AGGREGATED,
+    ):
         # The worker's index in its group; rollouts report it, as
         # generate_async results do.
         self._leader_worker_idx = leader_worker_idx
+        # AGGREGATED serves whole rollouts; PREFILL and DECODE each serve one
+        # half, and start_dynamo_endpoint registers the engine as that half.
+        self.disaggregation_mode = disaggregation_mode
 
     @classmethod
     async def from_args(cls, argv=None):
@@ -94,6 +110,8 @@ class DynamoEngineAdapter(LLMEngine):
 
     def _handlers(self) -> dict[str, RequestHandler]:
         """The request kinds served, keyed by the annotation prefix that marks them."""
+        if self.disaggregation_mode is DisaggregationMode.PREFILL:
+            return {ROLLOUT_ANNOTATION: self._prefill_rollout}
         return {ROLLOUT_ANNOTATION: self._generate_rollout}
 
     async def generate(
@@ -126,12 +144,21 @@ class DynamoEngineAdapter(LLMEngine):
         the driver assembles the same output ``generate_async`` returns.
         """
         rollout = json.loads(rollout_spec)
-        served = await self.serve_rollout(
-            list(request["token_ids"]),
-            greedy=rollout["greedy"],
-            stop_strings=rollout["stop_strings"],
-            request_id=context.id(),
-        )
+        handoff: Optional[Handoff] = None
+        if self.disaggregation_mode is DisaggregationMode.DECODE:
+            prefill = require_prefill_result(request, DisaggregationMode.DECODE)
+            handoff = prefill["disaggregated_params"]
+        try:
+            served = await self.serve_rollout(
+                list(request["token_ids"]),
+                greedy=rollout["greedy"],
+                stop_strings=rollout["stop_strings"],
+                request_id=context.id(),
+                handoff=handoff,
+            )
+        finally:
+            if handoff is not None:
+                await self.release_handoff(handoff)
         chunk: GenerateChunk = {
             "token_ids": served.result.token_ids,
             "index": 0,
@@ -145,6 +172,33 @@ class DynamoEngineAdapter(LLMEngine):
             chunk["completion_usage"] = served.usage
         yield chunk
 
+    async def _prefill_rollout(
+        self, request: GenerateRequest, rollout_spec: str, context: Context
+    ) -> AsyncGenerator[GenerateChunk, None]:
+        """The prefill half of one rollout: its handoff, for Dynamo to pass to decode."""
+        rollout = json.loads(rollout_spec)
+        prompt_token_ids = list(request["token_ids"])
+        handoff = await self.serve_prefill(
+            prompt_token_ids,
+            greedy=rollout["greedy"],
+            stop_strings=rollout["stop_strings"],
+            request_id=context.id(),
+        )
+        num_prompt_tokens = len(prompt_token_ids)
+        yield {
+            "token_ids": [],
+            "index": 0,
+            # Dynamo stops on any other finish reason without reading the
+            # handoff, so decode would never run.
+            "finish_reason": "length",
+            "completion_usage": {
+                "prompt_tokens": num_prompt_tokens,
+                "completion_tokens": 0,
+                "total_tokens": num_prompt_tokens,
+            },
+            "disaggregated_params": handoff,
+        }
+
     @abstractmethod
     async def serve_rollout(
         self,
@@ -153,8 +207,37 @@ class DynamoEngineAdapter(LLMEngine):
         greedy: bool,
         stop_strings: Optional[list[str]],
         request_id: str,
+        handoff: Optional[Handoff] = None,
     ) -> ServedRollout:
-        """Serve one rollout exactly as the worker's native ``generate_async`` does."""
+        """Serve one rollout exactly as the worker's native ``generate_async`` does.
+
+        On a decode engine ``handoff`` is what the prefill engine's
+        ``serve_prefill`` returned: the rollout reads the prompt's KV from there
+        instead of computing it. It is None on every other engine.
+        """
+
+    async def serve_prefill(
+        self,
+        prompt_token_ids: list[int],
+        *,
+        greedy: bool,
+        stop_strings: Optional[list[str]],
+        request_id: str,
+    ) -> Handoff:
+        """Prefill engines only: compute the prompt's KV, keep it, and say where it is.
+
+        The KV stays held until the decode engine's ``release_handoff``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not serve the prefill half of a rollout"
+        )
+
+    async def release_handoff(self, handoff: Handoff) -> None:
+        """Decode engines only: let the prefill engine free what ``handoff`` holds.
+
+        Called once per handoff, after ``serve_rollout`` returned or raised. A
+        backend whose prefill KV frees itself keeps this default.
+        """
 
     @abstractmethod
     async def start(self, worker_id: int) -> EngineConfig:
@@ -189,6 +272,7 @@ def start_dynamo_endpoint(
     model_name: str,
     namespace: str,
     engine_env: dict[str, str],
+    component: str = DYNAMO_COMPONENT,
 ) -> asyncio.Task:
     """Register ``adapter``'s engine with Dynamo and serve it on the running loop.
 
@@ -196,6 +280,9 @@ def start_dynamo_endpoint(
     it is served under. Dynamo registers a Hub ID from its config and tokenizer
     files alone. Chat calls are rendered by NeMo RL's chat engine in the
     frontend, not Dynamo's renderer, so no template or parser is registered.
+    The engine registers as ``adapter.disaggregation_mode`` under ``component``;
+    prefill engines take a component of their own, so the frontend's prefill
+    router can find them.
 
     The Rust Worker serves until the process gets SIGTERM. It installs a chained
     handler, so Ray's actor handler still runs and the actor exits as usual;
@@ -205,7 +292,7 @@ def start_dynamo_endpoint(
     os.environ.update(engine_env)
     config = WorkerConfig(
         namespace=namespace,
-        component=DYNAMO_COMPONENT,
+        component=component,
         endpoint=DYNAMO_ENDPOINT,
         model_name=model_name,
         served_model_name=model_name,
@@ -214,6 +301,7 @@ def start_dynamo_endpoint(
         discovery_backend=engine_env["DYN_DISCOVERY_BACKEND"],
         request_plane=engine_env["DYN_REQUEST_PLANE"],
         event_plane=engine_env["DYN_EVENT_PLANE"],
+        disaggregation_mode=adapter.disaggregation_mode,
         # This is NeMo RL's process: Dynamo's setup would replace its root
         # handler and level, and vLLM's handlers.
         configure_logging=False,
