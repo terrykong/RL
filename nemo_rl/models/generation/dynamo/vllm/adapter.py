@@ -60,6 +60,7 @@ from vllm.v1.metrics.loggers import StatLoggerBase
 from nemo_rl.models.generation.dynamo.config import DynamoCfg
 from nemo_rl.models.generation.dynamo.engine_adapter import (
     DynamoEngineAdapter,
+    Handoff,
     RequestHandler,
     ServedRollout,
 )
@@ -261,7 +262,10 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         greedy: bool,
         stop_strings: Optional[list[str]],
         request_id: str,
+        handoff: Optional[Handoff] = None,
     ) -> ServedRollout:
+        # vLLM engines register aggregated, so no handoff ever reaches them.
+        del handoff
         result, final_output = await self._host._serve_rollout(
             TokensPrompt(prompt_token_ids=prompt_token_ids),
             prompt_token_ids=prompt_token_ids,

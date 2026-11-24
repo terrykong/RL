@@ -15,11 +15,11 @@
 
 One engine is one ``MegatronGeneration`` over its own worker group, the same
 dedicated inference policy the Megatron backend already builds, with its role
-in its config. Once the first refit has built the engine, its rank zero hosts
-Megatron-LM's Dynamo adapter (``MegatronLLMEngine``, driven by a Dynamo
-``Worker`` task on the inference loop), which registers the engine with the
-frontend, forwards requests to the engine's coordinator, and carries the KV
-handoff between prefill and decode. ``MegatronDynamoGeneration`` makes the
+in its config. Once the first refit has built the engine, its rank zero serves
+it through ``DynamoMegatronAdapter`` (a Dynamo ``Worker`` task on the
+inference loop), which registers the engine with the frontend, calls the engine
+in-process, and carries the KV handoff between prefill and decode.
+``MegatronDynamoGeneration`` makes the
 engines exist, in refit rank order, starts their endpoints, and is their refit
 side.
 """
@@ -256,11 +256,6 @@ class MegatronDynamoEngine:
 
     def prepare_for_generation(self, *, tags: list[str]) -> list[ray.ObjectRef]:
         return self._all("prepare_for_generation", tags=tags)
-
-    def attach_dynamo_events(self, *, parent_event_address: str) -> list[ray.ObjectRef]:
-        return self._all(
-            "attach_dynamo_events", parent_event_address=parent_event_address
-        )
 
     def set_rollout_weight_version(self, version: int) -> list[ray.ObjectRef]:
         return self._all("set_rollout_weight_version", version=version)
@@ -947,60 +942,42 @@ class MegatronDynamoGeneration(GenerationInterface):
     ) -> None:
         """Serve every engine through Dynamo; the engines must already be built.
 
-        Engine by engine, in record order: rank zero starts Megatron-LM's
-        adapter (``start_dynamo_endpoint``), then every rank points its events
-        at it (``attach_dynamo_events``) and rank zero's "ready" lets the adapter
-        register the engine. The vLLM backend does the same once its engines
-        serve; Megatron engines get their weights, and so their engine, at the
-        first refit, so this runs right after it. Goes through the workers'
-        handles, so the SingleController actor's copy can run it too; the
-        workers return the first call's endpoint on a repeat.
+        Each engine's rank zero starts its ``DynamoMegatronAdapter``
+        (``start_dynamo_endpoint``), which registers the engine as its role. The
+        vLLM backend does the same once its engines serve; Megatron engines get
+        their weights, and so their engine, at the first refit, so this runs
+        right after it. Goes through the workers' handles, so the
+        SingleController actor's copy can run it too; a repeat start on a
+        worker does nothing.
 
         Args:
             namespace: Dynamo namespace shared with the frontend.
-            engine_env: etcd / NATS variables from the managed runtime.
+            engine_env: The managed runtime's environment for engines.
             model_name: The served model; also the name it is served under.
             timeout_s: Bound on the whole call.
         """
         if self._endpoints_started:
             return
         deadline = time.monotonic() + timeout_s
-        # Ports are node-local: a later engine on a node avoids the ports the
-        # earlier engines on that node took.
-        ports_by_node: dict[str, set[int]] = {}
-        for record in self._engine_records:
-            used_ports = ports_by_node.setdefault(record.node_ip, set())
+        starts = [
+            record.leader.start_dynamo_endpoint.remote(
+                namespace=namespace,
+                engine_env=dict(engine_env),
+                model_name=model_name,
+                leader_worker_idx=index,
+            )
+            for index, record in enumerate(self._engine_records)
+        ]
+        for record, start in zip(self._engine_records, starts, strict=True):
             try:
-                metadata = ray.get(
-                    record.leader.start_dynamo_endpoint.remote(
-                        namespace=namespace,
-                        manager_env=dict(engine_env),
-                        model_name=model_name,
-                        served_model_name=model_name,
-                        # Native rollouts post token-ID completions; chat stays off.
-                        endpoint_types=["completions"],
-                        engine_start_timeout_s=self._dynamo_cfg.startup_timeout_s,
-                        excluded_ports=sorted(used_ports),
-                    ),
-                    timeout=_seconds_left(deadline),
-                )
-                used_ports.update(
-                    {int(metadata["event_port"]), int(metadata["system_port"])}
-                )
-                ray.get(
-                    record.attach_dynamo_events(
-                        parent_event_address=metadata["parent_event_address"]
-                    ),
-                    timeout=_seconds_left(deadline),
-                )
+                ray.get(start, timeout=_seconds_left(deadline))
             except Exception as error:
                 error.add_note(
                     f"while starting the Dynamo endpoint of {record.instance_id}"
                 )
                 raise
             print(
-                f"  [Dynamo:{record.instance_id}] endpoint started on "
-                f"{metadata['node_ip']}, handoff owner={metadata['handoff_owner']}",
+                f"  [Dynamo:{record.instance_id}] endpoint started on {record.node_ip}",
                 flush=True,
             )
         self._endpoints_started = True

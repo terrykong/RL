@@ -16,6 +16,7 @@
 
 import asyncio
 import copy
+import inspect
 import pickle
 from types import SimpleNamespace
 from typing import Any
@@ -36,6 +37,9 @@ from nemo_rl.models.generation.megatron.dynamo_config import (
 from nemo_rl.models.generation.megatron.dynamo_generation import (
     MegatronDynamoEngine,
     MegatronDynamoGeneration,
+)
+from nemo_rl.models.generation.megatron.dynamo_worker_mixin import (
+    MegatronDynamoGenerationMixin,
 )
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.weight_sync.membership import desired_membership
@@ -183,9 +187,7 @@ class _FakeEngine:
         self.unclean_shutdown = False
         self.fail_calls = False
         self.shutdown_calls = 0
-        # (rank, parent_event_address) per attach_dynamo_events call.
-        self.attached: list[tuple[int, str]] = []
-        self.metadata = None
+        # What rank zero's start_dynamo_endpoint got; None until it started.
         self.endpoint_kwargs = None
         # What rank zero's dynamo_endpoint_error reports; None while serving.
         self.endpoint_error = None
@@ -206,7 +208,6 @@ class _FakeEngine:
             return _Ref(self.alive)
         if method in (
             "start_dynamo_endpoint",
-            "attach_dynamo_events",
             "stop_dynamo_endpoint",
             "dynamo_endpoint_error",
         ):
@@ -254,35 +255,24 @@ class _FakeEngine:
     def role(self) -> str:
         return self.kwargs["config"]["generation"]["_dynamo_role"]
 
-    def _start_dynamo_endpoint(self, rank, **kwargs):
-        """Rank zero's endpoint start: node-local ports, an owner for decode."""
+    def _start_dynamo_endpoint(
+        self, rank, *, namespace, engine_env, model_name, leader_worker_idx
+    ):
+        """Rank zero's endpoint start; a repeat start does nothing."""
         assert rank == 0
-        if self.metadata is not None:
-            return self.metadata
-        index = len(self.env.endpoints)
-        if self.env.fail_endpoint_at == index:
+        if self.endpoint_kwargs is not None:
+            return None
+        if self.env.fail_endpoint_of == self.name:
             raise RuntimeError(f"endpoint {self.name} failed to start")
-        self.endpoint_kwargs = kwargs
-        node_ip = self.kwargs["cluster"].placement_group.bundle_nodes[0]
-        self.event_port = 7000 + 2 * index
-        self.system_port = self.event_port + 1
-        self.owner = f"owner-{self.name}" if self.role == "decode" else None
+        self.endpoint_kwargs = {
+            "namespace": namespace,
+            "engine_env": engine_env,
+            "model_name": model_name,
+            "leader_worker_idx": leader_worker_idx,
+        }
         self.env.endpoints.append(self)
         self.log.append(f"endpoint {self.name} {self.role}")
-        self.metadata = {
-            "node_ip": node_ip,
-            "event_port": self.event_port,
-            "system_port": self.system_port,
-            "parent_event_address": f"tcp://{node_ip}:{self.event_port}",
-            "handoff_owner": self.owner,
-        }
-        return self.metadata
-
-    def _attach_dynamo_events(self, rank, *, parent_event_address):
-        self.attached.append((rank, parent_event_address))
-        if rank == 0:
-            self.log.append(f"attach {self.name}")
-        return True
+        return None
 
     def _stop_dynamo_endpoint(self, rank):
         assert rank == 0
@@ -363,7 +353,7 @@ class _Env:
         self.endpoints: list[_FakeEngine] = []
         self.runtimes: list[_FakeRuntime] = []
         self.fail_engine_at = None
-        self.fail_endpoint_at = None
+        self.fail_endpoint_of: str | None = None
         self.ray = _FakeRay()
 
         def make_cluster(**kwargs):
@@ -900,42 +890,30 @@ def _start_endpoints(generation) -> None:
     )
 
 
-def test_start_endpoints_starts_rank_zero_then_attaches_every_rank(env):
+def test_the_fake_endpoint_start_matches_the_worker_hook():
+    real = inspect.signature(MegatronDynamoGenerationMixin.start_dynamo_endpoint)
+    fake = inspect.signature(_FakeEngine._start_dynamo_endpoint)
+    assert list(fake.parameters)[2:] == list(real.parameters)[1:]
+
+
+def test_start_endpoints_starts_every_engines_rank_zero(env):
     generation = env.started()
 
     _start_endpoints(generation)
 
-    # Engine by engine: rank zero's endpoint, then every rank's events.
-    assert env.log == [
-        line
-        for name, role in zip(_IDS, _ROLES)
-        for line in (f"endpoint {name} {role}", f"attach {name}")
+    # Rank zero only (the fake checks), one start per engine.
+    assert env.log == [f"endpoint {name} {role}" for name, role in zip(_IDS, _ROLES)]
+    # Every engine registers with the runtime's environment as is (no ports
+    # to pick), and reports its index in the fleet.
+    assert [e.endpoint_kwargs for e in env.endpoints] == [
+        {
+            "namespace": "ns",
+            "engine_env": {"ETCD_ENDPOINTS": "http://etcd:2379"},
+            "model_name": "Qwen/Qwen3-0.6B",
+            "leader_worker_idx": index,
+        }
+        for index in range(len(_IDS))
     ]
-    for engine in env.engines:
-        address = engine.metadata["parent_event_address"]
-        assert engine.attached == [(0, address), (1, address)]
-    assert [e.owner for e in env.endpoints] == [
-        None,
-        "owner-decode-0",
-        "owner-decode-1",
-    ]
-    # The second engine on 10.0.0.1 avoids the first one's ports; the engine on
-    # 10.0.0.2 starts fresh.
-    first = env.endpoints[0]
-    assert [e.endpoint_kwargs["excluded_ports"] for e in env.endpoints] == [
-        [],
-        [first.event_port, first.system_port],
-        [],
-    ]
-    assert first.endpoint_kwargs == {
-        "namespace": "ns",
-        "manager_env": {"ETCD_ENDPOINTS": "http://etcd:2379"},
-        "model_name": "Qwen/Qwen3-0.6B",
-        "served_model_name": "Qwen/Qwen3-0.6B",
-        "endpoint_types": ["completions"],
-        "engine_start_timeout_s": 600,
-        "excluded_ports": [],
-    }
     # Later refits do not start them again.
     env.log.clear()
     _start_endpoints(generation)
@@ -943,15 +921,17 @@ def test_start_endpoints_starts_rank_zero_then_attaches_every_rank(env):
 
 
 def test_start_endpoints_names_the_engine_that_failed(env):
-    env.fail_endpoint_at = 1
+    env.fail_endpoint_of = "decode-0"
     generation = env.started()
     with pytest.raises(RuntimeError, match="failed to start") as raised:
         _start_endpoints(generation)
     assert "decode-0" in str(raised.value.__notes__)
-    # The next attempt resumes where the workers left off.
-    env.fail_endpoint_at = None
+    # The next attempt starts only what did not start.
+    env.fail_endpoint_of = None
+    env.log.clear()
     _start_endpoints(generation)
-    assert [e.name for e in env.endpoints] == _IDS
+    assert env.log == ["endpoint decode-0 decode"]
+    assert sorted(e.name for e in env.endpoints) == sorted(_IDS)
 
 
 def test_check_alive_names_the_dead_engines(env):
@@ -991,9 +971,7 @@ def test_first_resume_starts_the_endpoints_and_awaits_the_frontend(env):
     # The first resume is the engines' startup: the refit built them, so their
     # endpoints start now, and the frontend must list both components.
     assert env.log == [f"{name}.resume" for name in _NAMES] + [
-        line
-        for name, role in zip(_IDS, _ROLES)
-        for line in (f"endpoint {name} {role}", f"attach {name}")
+        f"endpoint {name} {role}" for name, role in zip(_IDS, _ROLES)
     ]
     assert env.runtime.waits == [{"prefill": 1, "backend": 2}]
     env.log.clear()
