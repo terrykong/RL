@@ -1994,7 +1994,54 @@ async def test_generation_cut_fan_out_merges_without_a_late_frontend(
     # The late frontend's calls regenerate; the cut still answers in time.
     assert time.monotonic() - started < 2.0
     assert merged == [(typed, [["own"]])]
-    assert "1 of 2 HTTP frontends did not answer in time" in caplog.text
+    assert "['http://127.0.0.1:1'] did not answer in time" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fan_out_cut_merges_in_target_order_and_names_late_targets(
+    monkeypatch, caplog
+):
+    merged = []
+
+    def merge_cut_receipts(inventory, prefixes):
+        merged.append(list(prefixes))
+        return "receipt"
+
+    monkeypatch.setattr(generation_cut_route, "merge_cut_receipts", merge_cut_receipts)
+
+    async def answer(acks, delay):
+        await asyncio.sleep(delay)
+        return acks
+
+    receipt = await generation_cut_route.fan_out_cut(
+        types.SimpleNamespace(checkpoint_id="checkpoint-1"),
+        {
+            "first": answer(["a"], 0.05),
+            "late": answer(["late"], 5),
+            "second": answer(["b"], 0),
+        },
+        deadline=time.time() + 0.3,
+    )
+
+    assert receipt == "receipt"
+    # Target order, not the order they finished in.
+    assert merged == [[["a"], ["b"]]]
+    assert "['late'] did not answer in time" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_frontend_cut_peer_timeout_costs_only_its_calls(monkeypatch):
+    def timed_out(*args, **kwargs):
+        raise TimeoutError
+
+    monkeypatch.setattr(generation_cut_route.aiohttp, "ClientSession", timed_out)
+    fan_out = generation_cut_route.FrontendCutFanOut(
+        types.SimpleNamespace(control_token="control-token"), ()
+    )
+    inventory = types.SimpleNamespace(model_dump=lambda mode: {"calls": []})
+
+    # Not one of aiohttp's own errors, so only a broad catch keeps the cut alive.
+    assert await fan_out._cut_on_peer("http://127.0.0.1:1", inventory, None) == ()
 
 
 @pytest.mark.asyncio

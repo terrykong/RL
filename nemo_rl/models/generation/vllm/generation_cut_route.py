@@ -20,7 +20,7 @@ import asyncio
 import logging
 import secrets
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from typing import Any, Protocol
 
 import aiohttp
@@ -92,6 +92,42 @@ def merge_cut_receipts(inventory: Any, engine_prefixes: Iterable[Sequence[Any]])
             cut.get(prefix.ticket_id) or GenerationCutPrefixAck.failure(prefix)
             for prefix in inventory.active_prefixes
         ),
+    )
+
+
+async def fan_out_cut(
+    inventory: Any,
+    cuts: Mapping[str, Awaitable[Sequence[Any]]],
+    *,
+    deadline: float | None,
+) -> Any:
+    """Wait for every target's cut until ``deadline`` and merge their acks.
+
+    Each awaitable in ``cuts`` (keyed by a name for the logs) returns the
+    durable acks of one target: a Dynamo engine, or one of a worker's HTTP
+    frontends. A target that misses the wall-clock ``deadline`` is cancelled
+    and its calls regenerate after a restore. A target that should cost only
+    its own calls when it fails must catch its errors and return ``()``.
+    """
+    tasks = {asyncio.ensure_future(cut): name for name, cut in cuts.items()}
+    done: set[asyncio.Future[Sequence[Any]]] = set()
+    if tasks:
+        done, late = await asyncio.wait(
+            tasks,
+            timeout=None if deadline is None else max(0.0, deadline - time.time()),
+        )
+        for task in late:
+            task.cancel()
+        if late:
+            LOGGER.warning(
+                "generation cut %s: %s did not answer in time; calls they hold "
+                "regenerate after a restore",
+                inventory.checkpoint_id,
+                sorted(tasks[task] for task in late),
+            )
+    # In target order, so which ack wins for a call cut twice does not vary.
+    return merge_cut_receipts(
+        inventory, [task.result() for task in tasks if task in done]
     )
 
 
@@ -178,28 +214,17 @@ class FrontendCutFanOut:
         # One deadline, from the cut's arrival, for this wait and every frontend.
         timeout_s = self._recovery.control_timeout_s
         deadline = None if timeout_s is None else time.time() + timeout_s
-        cuts = [
-            asyncio.ensure_future(self._cut_here(inventory, deadline)),
-            *(
-                asyncio.ensure_future(self._cut_on_peer(url, inventory, deadline))
-                for url in self._peer_urls
-            ),
-        ]
-        done, late = await asyncio.wait(
-            cuts,
-            timeout=None if deadline is None else max(0.0, deadline - time.time()),
+        return await fan_out_cut(
+            inventory,
+            {
+                "this frontend": self._cut_here(inventory, deadline),
+                **{
+                    url: self._cut_on_peer(url, inventory, deadline)
+                    for url in self._peer_urls
+                },
+            },
+            deadline=deadline,
         )
-        for cut in late:
-            cut.cancel()
-        if late:
-            LOGGER.warning(
-                "generation cut %s: %d of %d HTTP frontends did not answer in "
-                "time; calls they hold regenerate after a restore",
-                inventory.checkpoint_id,
-                len(late),
-                len(cuts),
-            )
-        return merge_cut_receipts(inventory, [cut.result() for cut in done])
 
     async def _cut_here(self, inventory: Any, deadline: float | None) -> list[Any]:
         receipt = await self._recovery.run_cut(
@@ -211,7 +236,10 @@ class FrontendCutFanOut:
         self, url: str, inventory: Any, deadline: float | None
     ) -> Sequence[Any]:
         try:
-            async with aiohttp.ClientSession() as session:
+            # fan_out_cut enforces the deadline; aiohttp's own 300 s default
+            # would end a longer cut with an error instead.
+            timeout = aiohttp.ClientTimeout(total=None)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{url}{FRONTEND_CUT_ROUTE}",
                     json={
@@ -222,8 +250,8 @@ class FrontendCutFanOut:
                 ) as response:
                     response.raise_for_status()
                     return (await response.json())["prefixes"]
-        # One frontend's failure must cost only the calls it holds.
-        except (aiohttp.ClientError, KeyError, TypeError, ValueError):
+        # One frontend's failure must cost only the calls it holds, whatever it is.
+        except Exception:  # noqa: BLE001
             LOGGER.warning(
                 "generation cut failed on HTTP frontend %s; calls it holds "
                 "regenerate after a restore",
