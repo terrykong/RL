@@ -44,7 +44,7 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
 from nemo_rl.models.generation.vllm.generation_cut_route import (
     GENERATION_CUT_ROUTE,
     answer_generation_cut,
-    merge_cut_receipts,
+    fan_out_cut,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -106,29 +106,16 @@ class EngineCutFanOut:
                 DEADLINE_KEY: deadline,
             },
         }
-        cuts = {
-            asyncio.ensure_future(
-                self._cut_on_engine(client, request, instance_id)
-            ): instance_id
-            for instance_id in client.instance_ids()
-        }
-        engine_prefixes = []
-        if cuts:
-            done, late = await asyncio.wait(
-                cuts,
-                timeout=None if deadline is None else max(0.0, deadline - time.time()),
-            )
-            for cut in late:
-                cut.cancel()
-            if late:
-                LOGGER.warning(
-                    "generation cut %s: engines %s did not answer in time; calls "
-                    "they hold regenerate after a restore",
-                    inventory.checkpoint_id,
-                    sorted(cuts[cut] for cut in late),
+        return await fan_out_cut(
+            inventory,
+            {
+                f"engine {instance_id}": self._cut_on_engine(
+                    client, request, instance_id
                 )
-            engine_prefixes = [cut.result() for cut in done]
-        return merge_cut_receipts(inventory, engine_prefixes)
+                for instance_id in client.instance_ids()
+            },
+            deadline=deadline,
+        )
 
     @staticmethod
     async def _cut_on_engine(
